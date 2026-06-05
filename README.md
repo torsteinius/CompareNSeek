@@ -12,8 +12,69 @@ Kort sagt:
 4. Deretter går det videre til andre IFS/Oracle-tabeller med nok rader.
 5. Det sammenligner navn, datatyper og faktiske verdier.
 6. Det skriver CSV-rapporter som viser beste IFS-kandidat per DWH-kolonne.
+7. `streamlit_app.py` kan brukes til å importere rapportene, vurdere kandidater, markere hull og eksportere bekreftet mapping.
 
-Målet er ikke å automatisk bevise fasiten, men å lage en god arbeidsliste for migrering og kildekartlegging.
+Målet er ikke å automatisk bevise fasiten, men å lage en god arbeidsliste for migrering og kildekartlegging. Streamlit-appen er kontrollpanelet der arbeidslisten kan bearbeides over tid.
+
+## Rask start
+
+Installer avhengigheter:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Kjør profileringsscriptet:
+
+```powershell
+python CompareAndSeek.py
+```
+
+Start kontrollpanelet:
+
+```powershell
+streamlit run streamlit_app.py
+```
+
+Streamlit-appen oppretter automatisk en lokal SQLite-database i `data/compare_seek.sqlite` første gang den startes.
+
+## Streamlit-kontrollpanel
+
+`streamlit_app.py` er et lokalt arbeidsverktøy for å holde styr på migreringsmappingen etter at CompareNSeek har laget kandidater.
+
+Appen har sider for:
+
+- **Dashboard**: viser totalt antall DWH-felter, bekreftede mappinger, kandidater, fagavklaringer, hull og ukjente felter.
+- **Import**: importerer target fields, source fields og field matches fra CSV.
+- **Table Explorer**: viser status per felt i valgt DWH-tabell.
+- **Field Detail**: viser én DWH-kolonne, kandidatene fra ny kilde og handlinger for bekreftelse, avvisning og kommentarer.
+- **Gap List**: viser felter som fortsatt mangler kandidat eller trenger vurdering.
+- **Source Explorer**: lar deg søke i scannede IFS/Oracle-kolonner og legge inn manuelle kandidater.
+- **Export**: eksporterer bekreftet eller delvis ferdig mapping til CSV.
+
+Statusene i appen er bevisst arbeidsorienterte:
+
+- `unknown`: feltet er importert, men ikke analysert
+- `not_analyzed`: feltet er kjent, men matching er ikke kjørt
+- `candidates_found`: feltet har minst én kandidat
+- `needs_review`: feltet må vurderes av fagperson eller teknisk ansvarlig
+- `confirmed`: kandidat er bekreftet som riktig mapping
+- `no_candidates`: ingen god kandidat er funnet
+- `not_in_new_source`: feltet finnes ikke i ny kilde
+- `deprecated`: feltet skal ikke videreføres
+
+Nye importer skal ikke overskrive manuelle beslutninger. Hvis en kandidat allerede er `confirmed` eller `rejected`, beholdes den vurderingen når nye CSV-er importeres.
+
+### Anbefalt importflyt
+
+1. Importer target fields fra `03_dwh_columns.csv`.
+2. Importer source fields fra `02_oracle_columns.csv`.
+3. Importer kandidater fra `07_best_mapping_per_dwh_column.csv` for flere kandidater per DWH-felt.
+4. Importer eventuelt `09_dwh_column_mapping_summary.csv` hvis du vil starte med beste kandidat per felt.
+5. Bruk `Field Detail` til å bekrefte, avvise, kommentere eller markere hull.
+6. Eksporter ferdig mapping fra `Export`.
+
+Importen tåler også CompareAndSeek-navn som `dwh_table`, `dwh_column`, `oracle_owner`, `oracle_table`, `oracle_column`, `datatype_score`, `value_overlap_score` og `reason`.
 
 ## Hva scriptet gjør
 
@@ -219,6 +280,8 @@ Ved første kjøring bør man normalt kjøre uten `--skip-*`, slik at både DWH 
 
 Rapporter skrives til `ifs_profile_output/reports/`.
 
+Disse rapportene kan åpnes direkte i regneark, men de kan også importeres i Streamlit-appen for strukturert gjennomgang og godkjenning.
+
 ### Anbefalt rekkefølge
 
 Start med disse:
@@ -314,11 +377,11 @@ Lav score betyr ikke nødvendigvis at kolonnen ikke finnes i IFS. Det kan også 
    python CompareAndSeek.py --dwh-tables dim_avtale --suspects-file suspects.txt
    ```
 
-4. Åpne `09_dwh_column_mapping_summary.csv` og marker kandidater som virker riktige.
+4. Start Streamlit-appen og importer `03_dwh_columns.csv`, `02_oracle_columns.csv` og `07_best_mapping_per_dwh_column.csv`.
 
-5. Bruk `07_best_mapping_per_dwh_column.csv` for kolonner der beste kandidat er usikker.
+5. Bruk `Dashboard` og `Table Explorer` for å se hvilke felter som har kandidater, hull eller trenger vurdering.
 
-6. Bruk `05_oracle_value_hits.csv` for å sjekke konkrete verdifunn.
+6. Bruk `Field Detail` til å bekrefte eller avvise kandidater. Bruk `05_oracle_value_hits.csv` ved behov for å sjekke konkrete verdifunn.
 
 7. Juster eventuelt `--min-total-score`:
 
@@ -326,4 +389,6 @@ Lav score betyr ikke nødvendigvis at kolonnen ikke finnes i IFS. Det kan også 
    python CompareAndSeek.py --dwh-tables dim_avtale --min-total-score 0.35
    ```
 
-8. Når en tabell ser fornuftig ut, kjør bredere mot flere `dim_` og `fact_`-objekter.
+8. Importer nye kandidatrapporter i Streamlit etter nye kjøringer. Bekreftede og avviste vurderinger beholdes.
+
+9. Når en tabell ser fornuftig ut, kjør bredere mot flere `dim_` og `fact_`-objekter.
