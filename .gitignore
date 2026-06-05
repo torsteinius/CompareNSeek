@@ -1,4 +1,5 @@
 *.txt
+!requirements.txt
 .env
 .git_nested_backup*/
 ifs_profile_output/
