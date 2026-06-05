@@ -6,8 +6,10 @@ Formål:
 - Bygge et lokalt metadata-bibliotek over IFS/Oracle-kilden.
 - Finne tabeller med data.
 - Hente kolonner, radantall/estimert radantall og 10 eksempelrader.
-- Sammenligne DWH/Lydia-felter mot Oracle/IFS-tabeller og kolonner.
-- Lage en stadig bedre oversikt for migrering fra Lydia-DWH til IFS-master.
+- Lese DWH-kolonner dynamisk fra SQL Server/datavarehus.
+- Prioritere kjente/suspekte IFS-tabeller fra suspects.txt når den finnes.
+- Sammenligne DWH-kolonner mot Oracle/IFS-tabeller og kolonner.
+- Lage en stadig bedre oversikt for migrering fra DWH til ny kilde/master.
 
 Avhengigheter:
     pip install oracledb pyodbc pandas python-dotenv
@@ -21,8 +23,8 @@ Miljøvariabler:
     Lokale verdier kan legges i setup.txt, som holdes utenfor git.
 
 Kjøring:
-    python ifs_oracle_source_profiler.py --min-rows 1 --sample-rows 10
-    python ifs_oracle_source_profiler.py --schemas IFSAPP --min-rows 10
+    python CompareAndSeek.py --min-rows 1 --sample-rows 10
+    python CompareAndSeek.py --schemas IFSAPP --suspects-file suspects.txt --min-rows 10
 """
 
 from __future__ import annotations
@@ -71,83 +73,42 @@ REPORT_DIR = OUT_DIR / "reports"
 SAMPLE_DIR = OUT_DIR / "samples"
 
 DEFAULT_SCHEMAS: list[str] = ["IFSAPP"]
+DEFAULT_SUSPECTS_FILE = Path("suspects.txt")
 
-# Viktige DWH-felt fra Lydia-migreringen/rapportene.
-# Dette er startlisten. Den kan utvides automatisk fra DWH-tabeller.
-BUSINESS_FIELDS = [
-    "Avtalenr",
-    "Avtalenavn",
-    "Avtalegruppe",
-    "KontraktFra",
-    "KontraktTil",
-    "Signaturdato",
-    "Overtagelsesdato",
-    "LeverandorNavn",
-    "LeverandorOrgnr",
-    "LeietakerNavn",
-    "LeietakerNr",
-    "LokNr",
-    "LokNavn",
-    "Byggnavn",
-    "Gateadresse",
-    "Gateadresse2",
-    "Postnr",
-    "Poststed",
-    "Websak",
-    "OppsigelsePeriode",
-    "OppsigelsesPeriodeMnd",
-    "HarOppsigelsesklausul",
-    "OppsigelsesVilkar",
-    "Opsjonmulighet_Kode",
-    "Opsjonsbeskrivelse",
-    "Opsjonsfrist_Dato",
-    "Opsjonsutlop_Dato",
-    "Egnethet_1_5",
-    "Politispesifikt_Areal_m2",
-    "Fellesareal_m2",
-    "Innv_Parkering_m2",
-    "Renhold_Kode",
-    "Renhold_Beskrivelse",
-    "Kantine_Kode",
-    "Kantine_Beskrivelse",
-    "Energi_Inkl_Felleskost_Kode",
-    "Off_Lokasjon_Kode",
-    "Forvaltningskategori_Kode",
-    "Investering_InnevAr",
-    "Investering_Ar2",
-    "Investering_Ar3",
-    "Investering_Ar4",
-    "Ny_Leie",
-    "Nytt_Areal",
-    "Gyldig_Fra_Ar",
-    "AntallLeieLinjer",
-    "Aarsleie_Leid_Areal_Kr",
-    "Felleskost_AKonto_Kr",
-    "KPI_Intervall_Mnd",
-    "KPI_Andel_Prosent",
-    "KPI_Indeks",
-    "Merknad",
-    "StatusId",
-]
-
-# Synonymer er viktig. Her kan vi legge på mer etter hvert.
+# Synonymer er generelle hjelperegler for navnematching. DWH-kolonnene leses fra databasen.
 SYNONYMS: dict[str, list[str]] = {
     "avtale": ["agreement", "contract", "lease", "rental", "supplier_agreement"],
     "avtalenr": ["agreement_no", "contract_no", "contract_id", "agreement_id", "lease_no", "num"],
     "avtalenavn": ["agreement_name", "contract_name", "description", "name"],
+    "gruppe": ["group", "category", "class"],
+    "nr": ["no", "number", "num", "id"],
+    "navn": ["name", "description"],
+    "kode": ["code", "id", "type"],
+    "dato": ["date"],
+    "periode": ["period", "interval"],
+    "beskrivelse": ["description", "text", "note"],
     "kontrakt": ["contract", "agreement", "lease"],
     "fra": ["from", "start", "valid_from", "date_from", "start_date"],
     "til": ["to", "end", "valid_to", "date_to", "end_date", "expire"],
     "leverandor": ["supplier", "vendor", "landlord", "party", "company"],
+    "orgnr": ["organization_no", "organisation_no", "org_no", "company_no", "vat_no"],
     "leietaker": ["customer", "tenant", "lessee", "org_unit"],
+    "kunde": ["customer", "tenant", "lessee"],
     "lokasjon": ["location", "site", "place", "object"],
+    "lok": ["location", "site", "place", "object"],
     "bygg": ["building", "property", "facility"],
+    "byggnavn": ["building_name", "property_name", "facility_name"],
     "adresse": ["address", "addr", "street"],
+    "gateadresse": ["address", "street", "street_address"],
     "postnr": ["postal", "zip", "post_code"],
     "poststed": ["city", "postal_area"],
     "websak": ["case", "case_ref", "reference", "doc", "document"],
     "oppsigelse": ["termination", "notice", "cancel"],
+    "oppsigelses": ["termination", "notice", "cancel"],
+    "vilkar": ["terms", "conditions"],
     "opsjon": ["option", "renewal", "extension"],
+    "opsjons": ["option", "renewal", "extension"],
+    "utlop": ["expire", "expiry", "expiration", "end"],
     "areal": ["area", "m2", "sqm", "square"],
     "parkering": ["parking", "garage"],
     "renhold": ["cleaning"],
@@ -166,6 +127,12 @@ SYNONYMS: dict[str, list[str]] = {
 # HJELP
 # =============================================================================
 
+@dataclass(frozen=True)
+class SourceTableHint:
+    owner: str | None
+    table_name: str
+    priority: int
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -183,8 +150,17 @@ def norm_text(value: Any) -> str:
 def tokenize(value: str) -> set[str]:
     if not value:
         return set()
-    raw = re.sub(r"([a-z])([A-Z])", r"\1_\2", value)
-    raw = raw.replace("ø", "o").replace("å", "a").replace("æ", "ae")
+    raw = (
+        value.replace("Ø", "O")
+        .replace("Å", "A")
+        .replace("Æ", "AE")
+        .replace("ø", "o")
+        .replace("å", "a")
+        .replace("æ", "ae")
+    )
+    raw = re.sub(r"([a-z])([A-Z])", r"\1_\2", raw)
+    raw = re.sub(r"([A-Za-z])([0-9])", r"\1_\2", raw)
+    raw = re.sub(r"([0-9])([A-Za-z])", r"\1_\2", raw)
     tokens = re.split(r"[^A-Za-z0-9]+", raw.lower())
     return {t for t in tokens if t and len(t) >= 2}
 
@@ -195,6 +171,11 @@ def expanded_tokens(name: str) -> set[str]:
     for t in list(tokens):
         out.update(SYNONYMS.get(t, []))
     return out
+
+
+def dwh_entity_tokens(table_name: str) -> set[str]:
+    entity = re.sub(r"^(dim|fact)_", "", table_name or "", flags=re.IGNORECASE)
+    return expanded_tokens(entity)
 
 
 def sqlserver_ident(value: str) -> str:
@@ -256,6 +237,90 @@ def qname(owner: str, table_name: str) -> str:
     return f'"{owner}"."{table_name}"'
 
 
+def resolve_config_path(path_value: str | Path) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return THIS_FILE.parent / path
+
+
+def load_source_table_hints(path: Path) -> list[SourceTableHint]:
+    """
+    Leser suspects.txt.
+
+    Format:
+      TABLE_NAME
+      OWNER.TABLE_NAME
+
+    Tomme linjer og linjer som starter med # ignoreres.
+    """
+    if not path.exists():
+        return []
+
+    hints: list[SourceTableHint] = []
+    seen: set[tuple[str | None, str]] = set()
+    with path.open("r", encoding="utf-8-sig") as f:
+        for raw_line in f:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+
+            owner: str | None = None
+            table_name = line
+            if "." in line:
+                owner_part, table_part = line.split(".", 1)
+                owner = owner_part.strip().strip('"[]').upper() or None
+                table_name = table_part
+
+            table_name = table_name.strip().strip('"[]').upper()
+            if not table_name:
+                continue
+
+            key = (owner, table_name)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            hints.append(SourceTableHint(owner=owner, table_name=table_name, priority=len(hints) + 1))
+
+    return hints
+
+
+def hint_priority(owner: str, table_name: str, hints: list[SourceTableHint]) -> int | None:
+    owner_upper = owner.upper()
+    table_upper = table_name.upper()
+    for hint in hints:
+        if hint.table_name != table_upper:
+            continue
+        if hint.owner is None or hint.owner == owner_upper:
+            return hint.priority
+    return None
+
+
+def store_source_table_hints(
+    local: sqlite3.Connection,
+    schemas: list[str],
+    hints: list[SourceTableHint],
+) -> None:
+    local.execute("delete from source_table_hints")
+    for hint in hints:
+        owners = [hint.owner] if hint.owner else [schema.upper() for schema in schemas]
+        for owner in owners:
+            local.execute(
+                """
+                insert or replace into source_table_hints
+                (owner, table_name, priority, source)
+                values (?, ?, ?, ?)
+                """,
+                (owner, hint.table_name, hint.priority, "suspects.txt"),
+            )
+    local.commit()
+
+
+def has_priority(value: Any) -> bool:
+    return value is not None and pd.notna(value)
+
+
 # =============================================================================
 # SQLITE LOKALT BIBLIOTEK
 # =============================================================================
@@ -304,6 +369,14 @@ def init_local_db(path: Path) -> sqlite3.Connection:
             row_json text not null,
             scanned_at text,
             primary key (owner, table_name, sample_no)
+        );
+
+        create table if not exists source_table_hints (
+            owner text not null,
+            table_name text not null,
+            priority integer not null,
+            source text,
+            primary key (owner, table_name)
         );
 
         create table if not exists dwh_columns (
@@ -545,13 +618,34 @@ def profile_oracle(
     min_rows: int,
     sample_rows: int,
     force_count: bool,
+    source_table_hints: list[SourceTableHint],
 ) -> None:
     print("Henter Oracle-tabeller ...")
     tables = get_oracle_tables(db, schemas)
     columns = get_oracle_columns(db, schemas)
     scanned_at = now_iso()
 
+    store_source_table_hints(local, schemas, source_table_hints)
+    if source_table_hints:
+        tables = tables.assign(
+            _hint_priority=[
+                hint_priority(r.OWNER, r.TABLE_NAME, source_table_hints) or 999999
+                for r in tables.itertuples(index=False)
+            ],
+            _rows_for_sort=tables["NUM_ROWS"].fillna(0),
+        ).sort_values(
+            by=["_hint_priority", "_rows_for_sort", "OWNER", "TABLE_NAME"],
+            ascending=[True, False, True, True],
+        )
+
     print(f"Fant {len(tables)} Oracle-tabeller og {len(columns)} kolonner.")
+    if source_table_hints:
+        matched_hints = sum(
+            1
+            for r in tables.itertuples(index=False)
+            if hint_priority(r.OWNER, r.TABLE_NAME, source_table_hints) is not None
+        )
+        print(f"Prioriterer {matched_hints} Oracle-tabeller fra suspects-listen først.")
 
     col_group = {
         (r.OWNER, r.TABLE_NAME): []
@@ -768,6 +862,25 @@ def load_dwh_columns(
         print("Ingen DWH-tabeller funnet/oppgitt.")
         return
 
+    for table_name in dwh_tables:
+        local.execute(
+            "delete from dwh_columns where schema_name = ? and table_name = ?",
+            (dwh_schema, table_name),
+        )
+        local.execute(
+            "delete from dwh_value_fingerprints where dwh_schema = ? and dwh_table = ?",
+            (dwh_schema, table_name),
+        )
+        local.execute(
+            "delete from oracle_value_hits where dwh_schema = ? and dwh_table = ?",
+            (dwh_schema, table_name),
+        )
+        local.execute(
+            "delete from mapping_candidates where dwh_schema = ? and dwh_table = ?",
+            (dwh_schema, table_name),
+        )
+    local.commit()
+
     table_filter = ",".join("?" for _ in dwh_tables)
 
     sql_cols = f"""
@@ -925,10 +1038,14 @@ def search_oracle_value_hits(
     db: OracleBaseCls,
     local: sqlite3.Connection,
     max_oracle_columns: int,
+    initial_probes_per_dwh_column: int,
     probes_per_dwh_column: int,
     max_hits_per_probe: int,
 ) -> None:
     scanned_at = now_iso()
+    local.execute("delete from oracle_value_hits")
+    local.commit()
+
     fingerprints = pd.read_sql(
         """
         select *
@@ -944,13 +1061,22 @@ def search_oracle_value_hits(
 
     oracle_cols = pd.read_sql(
         """
-        select c.*, t.scan_status, coalesce(t.counted_rows, t.num_rows_est, 0) as row_basis
+        select
+            c.*,
+            t.scan_status,
+            coalesce(t.counted_rows, t.num_rows_est, 0) as row_basis,
+            h.priority as suspect_priority
         from oracle_columns c
         join oracle_tables t
           on t.owner = c.owner
          and t.table_name = c.table_name
+        left join source_table_hints h
+          on h.owner = c.owner
+         and h.table_name = c.table_name
         where t.scan_status in ('has_data', 'unknown_rows')
         order by
+            case when h.priority is null then 1 else 0 end,
+            h.priority,
             case t.scan_status when 'has_data' then 0 else 1 end,
             coalesce(c.num_distinct, 999999999),
             row_basis desc
@@ -965,71 +1091,108 @@ def search_oracle_value_hits(
         for row in oracle_cols.itertuples(index=False)
         if oracle_kind(row.data_type) in {"text", "number", "date"}
     ]
+    max_probe_count = max(1, int(probes_per_dwh_column))
+    initial_probe_count = max(1, min(int(initial_probes_per_dwh_column), max_probe_count))
 
     print(
-        "Søker etter DWH-verdi-fingeravtrykk i IFS "
-        f"({len(fingerprints)} verdier, {len(compatible_cols)} Oracle-kolonner) ..."
+        "Søker progressivt etter DWH-verdi-fingeravtrykk i IFS "
+        f"({len(fingerprints)} verdier, {len(compatible_cols)} Oracle-kolonner, "
+        f"initial={initial_probe_count}, maks={max_probe_count}) ..."
     )
+    suspect_col_count = sum(1 for row in compatible_cols if has_priority(row.suspect_priority))
+    if suspect_col_count:
+        print(f"Søker i {suspect_col_count} kompatible kolonner fra suspects-tabeller først.")
+
+    def search_probe_against_columns(
+        probe: Any,
+        oracle_columns: list[Any],
+        stage: str,
+    ) -> set[tuple[str, str, str]]:
+        found_columns: set[tuple[str, str, str]] = set()
+        for o in oracle_columns:
+            predicate = build_oracle_value_predicate(
+                column_name=o.column_name,
+                oracle_data_type=o.data_type,
+                probe_kind=probe.value_kind,
+                probe_value=probe.value_text,
+            )
+            if predicate is None:
+                continue
+
+            where_sql, params, match_kind = predicate
+            params = {**params, "hit_limit": int(max_hits_per_probe) + 1}
+            sql_count = f"""
+                select count(*)
+                from (
+                    select 1
+                    from {qname(o.owner, o.table_name)}
+                    where {where_sql}
+                      and rownum <= :hit_limit
+                )
+            """
+
+            try:
+                rows = db.fetchall(sql_count, params)
+                hit_count = int(rows[0][0]) if rows else 0
+            except Exception:
+                continue
+
+            if hit_count <= 0:
+                continue
+
+            found_columns.add((o.owner, o.table_name, o.column_name))
+            local.execute(
+                """
+                insert or replace into oracle_value_hits
+                (dwh_schema, dwh_table, dwh_column, dwh_value_text,
+                 oracle_owner, oracle_table, oracle_column, oracle_data_type,
+                 match_kind, hit_count, sample_value, scanned_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    probe.dwh_schema,
+                    probe.dwh_table,
+                    probe.dwh_column,
+                    probe.value_text,
+                    o.owner,
+                    o.table_name,
+                    o.column_name,
+                    o.data_type,
+                    f"{match_kind}_{stage}",
+                    hit_count,
+                    probe.value_text,
+                    scanned_at,
+                ),
+            )
+        return found_columns
+
+    oracle_col_lookup = {
+        (row.owner, row.table_name, row.column_name): row
+        for row in compatible_cols
+    }
 
     grouped = fingerprints.groupby(["dwh_schema", "dwh_table", "dwh_column"], sort=False)
     for (_schema, _table, _column), group in grouped:
-        probes = group.head(probes_per_dwh_column)
-        for probe in probes.itertuples(index=False):
-            for o in compatible_cols:
-                predicate = build_oracle_value_predicate(
-                    column_name=o.column_name,
-                    oracle_data_type=o.data_type,
-                    probe_kind=probe.value_kind,
-                    probe_value=probe.value_text,
-                )
-                if predicate is None:
-                    continue
+        probes = group.head(max_probe_count)
+        initial_count = min(initial_probe_count, len(probes))
+        initial_hits: set[tuple[str, str, str]] = set()
 
-                where_sql, params, match_kind = predicate
-                params = {**params, "hit_limit": int(max_hits_per_probe) + 1}
-                sql_count = f"""
-                    select count(*)
-                    from (
-                        select 1
-                        from {qname(o.owner, o.table_name)}
-                        where {where_sql}
-                          and rownum <= :hit_limit
-                    )
-                """
+        for probe in probes.head(initial_count).itertuples(index=False):
+            initial_hits.update(search_probe_against_columns(probe, compatible_cols, "initial"))
 
-                try:
-                    rows = db.fetchall(sql_count, params)
-                    hit_count = int(rows[0][0]) if rows else 0
-                except Exception:
-                    continue
+        if not initial_hits:
+            continue
 
-                if hit_count <= 0:
-                    continue
-
-                sample_value = probe.value_text
-                local.execute(
-                    """
-                    insert or replace into oracle_value_hits
-                    (dwh_schema, dwh_table, dwh_column, dwh_value_text,
-                     oracle_owner, oracle_table, oracle_column, oracle_data_type,
-                     match_kind, hit_count, sample_value, scanned_at)
-                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        probe.dwh_schema,
-                        probe.dwh_table,
-                        probe.dwh_column,
-                        probe.value_text,
-                        o.owner,
-                        o.table_name,
-                        o.column_name,
-                        o.data_type,
-                        match_kind,
-                        hit_count,
-                        sample_value,
-                        scanned_at,
-                    ),
-                )
+        active_columns = [oracle_col_lookup[key] for key in initial_hits if key in oracle_col_lookup]
+        for probe in probes.iloc[initial_count:].itertuples(index=False):
+            confirming_hits = search_probe_against_columns(probe, active_columns, "confirming")
+            if not confirming_hits:
+                break
+            active_columns = [
+                oracle_col_lookup[key]
+                for key in confirming_hits
+                if key in oracle_col_lookup
+            ]
         local.commit()
 
 
@@ -1063,30 +1226,45 @@ def datatype_score(dwh_type: str, oracle_type: str) -> float:
     return 0.4
 
 
-def name_score(dwh_column: str, oracle_table: str, oracle_column: str) -> tuple[float, str]:
+def name_score(
+    dwh_column: str,
+    oracle_table: str,
+    oracle_column: str,
+    dwh_table: str | None = None,
+) -> tuple[float, str]:
     dwh_tokens = expanded_tokens(dwh_column)
+    dwh_table_tokens = dwh_entity_tokens(dwh_table or "")
     ora_col_tokens = expanded_tokens(oracle_column)
     ora_table_tokens = expanded_tokens(oracle_table)
 
     col_overlap = dwh_tokens & ora_col_tokens
     table_overlap = dwh_tokens & ora_table_tokens
+    entity_table_overlap = dwh_table_tokens & ora_table_tokens
+    entity_col_overlap = dwh_table_tokens & ora_col_tokens
 
     if not dwh_tokens:
         return 0.0, "no_tokens"
 
     score = 0.0
     if col_overlap:
-        score += 0.75 * (len(col_overlap) / max(len(dwh_tokens), 1))
+        score += 0.70 * (len(col_overlap) / max(len(dwh_tokens), 1))
     if table_overlap:
-        score += 0.25 * (len(table_overlap) / max(len(dwh_tokens), 1))
+        score += 0.15 * (len(table_overlap) / max(len(dwh_tokens), 1))
+    if entity_table_overlap:
+        score += 0.10 * (len(entity_table_overlap) / max(len(dwh_table_tokens), 1))
+    if entity_col_overlap:
+        score += 0.05 * (len(entity_col_overlap) / max(len(dwh_table_tokens), 1))
 
     # Direkte delstreng gir ekstra score
-    dn = "".join(sorted(dwh_tokens))
-    on = "".join(sorted(ora_col_tokens))
     if dwh_column.lower() in oracle_column.lower() or oracle_column.lower() in dwh_column.lower():
         score += 0.25
 
-    return min(score, 1.0), f"col_overlap={sorted(col_overlap)} table_overlap={sorted(table_overlap)}"
+    return min(score, 1.0), (
+        f"col_overlap={sorted(col_overlap)} "
+        f"table_overlap={sorted(table_overlap)} "
+        f"entity_table_overlap={sorted(entity_table_overlap)} "
+        f"entity_col_overlap={sorted(entity_col_overlap)}"
+    )
 
 
 def value_overlap_score(dwh_samples: list[str], oracle_sample_value: str | None) -> float:
@@ -1122,16 +1300,25 @@ def value_overlap_score(dwh_samples: list[str], oracle_sample_value: str | None)
 
 def build_mapping_candidates(local: sqlite3.Connection, min_total_score: float = 0.25) -> None:
     scanned_at = now_iso()
+    local.execute("delete from mapping_candidates")
+    local.commit()
 
     dwh_cols = pd.read_sql("select * from dwh_columns", local)
     ora_cols = pd.read_sql(
         """
-        select c.*, t.num_rows_est, t.counted_rows, t.scan_status
+        select c.*, t.num_rows_est, t.counted_rows, t.scan_status, h.priority as suspect_priority
         from oracle_columns c
         join oracle_tables t
           on t.owner = c.owner
          and t.table_name = c.table_name
+        left join source_table_hints h
+          on h.owner = c.owner
+         and h.table_name = c.table_name
         where t.scan_status in ('has_data', 'unknown_rows')
+        order by
+            case when h.priority is null then 1 else 0 end,
+            h.priority,
+            coalesce(t.counted_rows, t.num_rows_est, 0) desc
         """,
         local,
     )
@@ -1174,7 +1361,7 @@ def build_mapping_candidates(local: sqlite3.Connection, min_total_score: float =
             dwh_samples = []
 
         for o in ora_cols.itertuples(index=False):
-            ns, reason = name_score(d.column_name, o.table_name, o.column_name)
+            ns, reason = name_score(d.column_name, o.table_name, o.column_name, d.table_name)
             if ns < 0.05:
                 # billig filtrering: ignorer åpenbart irrelevante par
                 continue
@@ -1183,6 +1370,9 @@ def build_mapping_candidates(local: sqlite3.Connection, min_total_score: float =
             vs = value_overlap_score(dwh_samples, o.sample_value)
 
             total = (0.55 * ns) + (0.20 * ds) + (0.25 * vs)
+            if has_priority(o.suspect_priority):
+                total = min(total + 0.05, 1.0)
+                reason = f"{reason} suspect_priority={int(o.suspect_priority)}"
 
             if total >= min_total_score:
                 local.execute(
@@ -1217,16 +1407,25 @@ def build_mapping_candidates_with_value_hits(
     min_total_score: float = 0.25,
 ) -> None:
     scanned_at = now_iso()
+    local.execute("delete from mapping_candidates")
+    local.commit()
 
     dwh_cols = pd.read_sql("select * from dwh_columns", local)
     ora_cols = pd.read_sql(
         """
-        select c.*, t.num_rows_est, t.counted_rows, t.scan_status
+        select c.*, t.num_rows_est, t.counted_rows, t.scan_status, h.priority as suspect_priority
         from oracle_columns c
         join oracle_tables t
           on t.owner = c.owner
          and t.table_name = c.table_name
+        left join source_table_hints h
+          on h.owner = c.owner
+         and h.table_name = c.table_name
         where t.scan_status in ('has_data', 'unknown_rows')
+        order by
+            case when h.priority is null then 1 else 0 end,
+            h.priority,
+            coalesce(t.counted_rows, t.num_rows_est, 0) desc
         """,
         local,
     )
@@ -1269,7 +1468,7 @@ def build_mapping_candidates_with_value_hits(
             dwh_samples = []
 
         for o in ora_cols.itertuples(index=False):
-            ns, reason = name_score(d.column_name, o.table_name, o.column_name)
+            ns, reason = name_score(d.column_name, o.table_name, o.column_name, d.table_name)
             hit_key = (
                 d.schema_name,
                 d.table_name,
@@ -1287,6 +1486,9 @@ def build_mapping_candidates_with_value_hits(
             ds = datatype_score(d.data_type, o.data_type)
             vs = max(value_overlap_score(dwh_samples, o.sample_value), hit_score)
             total = (0.45 * ns) + (0.15 * ds) + (0.40 * vs)
+            if has_priority(o.suspect_priority):
+                total = min(total + 0.05, 1.0)
+                reason = f"{reason} suspect_priority={int(o.suspect_priority)}"
 
             if matched_probe_values:
                 reason = (
@@ -1331,14 +1533,26 @@ def write_reports(local: sqlite3.Connection) -> None:
     SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
 
     reports = {
-        "01_oracle_tables.csv": """
+        "00_source_table_hints.csv": """
             select *
-            from oracle_tables
+            from source_table_hints
+            order by priority, owner, table_name
+        """,
+        "01_oracle_tables.csv": """
+            select
+                t.*,
+                h.priority as suspect_priority
+            from oracle_tables t
+            left join source_table_hints h
+              on h.owner = t.owner
+             and h.table_name = t.table_name
             order by
-                case scan_status when 'has_data' then 0 when 'unknown_rows' then 1 else 2 end,
-                coalesce(counted_rows, num_rows_est, 0) desc,
-                owner,
-                table_name
+                case when h.priority is null then 1 else 0 end,
+                h.priority,
+                case t.scan_status when 'has_data' then 0 when 'unknown_rows' then 1 else 2 end,
+                coalesce(t.counted_rows, t.num_rows_est, 0) desc,
+                t.owner,
+                t.table_name
         """,
         "02_oracle_columns.csv": """
             select *
@@ -1391,6 +1605,63 @@ def write_reports(local: sqlite3.Connection) -> None:
             group by oracle_owner, oracle_table
             order by distinct_dwh_columns desc, avg_score desc
         """,
+        "09_dwh_column_mapping_summary.csv": """
+            with ranked as (
+                select
+                    *,
+                    row_number() over (
+                        partition by dwh_schema, dwh_table, dwh_column
+                        order by total_score desc
+                    ) as rn
+                from mapping_candidates
+            )
+            select
+                d.schema_name as dwh_schema,
+                d.table_name as dwh_table,
+                d.column_name as dwh_column,
+                d.data_type as dwh_data_type,
+                r.oracle_owner,
+                r.oracle_table,
+                r.oracle_column,
+                r.name_score,
+                r.datatype_score,
+                r.value_overlap_score,
+                r.total_score,
+                case
+                    when r.total_score >= 0.70 then 'strong'
+                    when r.total_score >= 0.45 then 'possible'
+                    when r.total_score is not null then 'weak'
+                    else 'no_candidate'
+                end as mapping_status,
+                r.reason
+            from dwh_columns d
+            left join ranked r
+              on r.dwh_schema = d.schema_name
+             and r.dwh_table = d.table_name
+             and r.dwh_column = d.column_name
+             and r.rn = 1
+            order by
+                d.table_name,
+                d.ordinal_position
+        """,
+        "10_dwh_columns_without_mapping.csv": """
+            select
+                d.schema_name,
+                d.table_name,
+                d.column_name,
+                d.data_type,
+                d.ordinal_position,
+                d.sample_values_json
+            from dwh_columns d
+            where not exists (
+                select 1
+                from mapping_candidates m
+                where m.dwh_schema = d.schema_name
+                  and m.dwh_table = d.table_name
+                  and m.dwh_column = d.column_name
+            )
+            order by d.table_name, d.ordinal_position
+        """,
     }
 
     for filename, sql in reports.items():
@@ -1426,6 +1697,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-rows", type=int, default=1)
     p.add_argument("--sample-rows", type=int, default=10)
     p.add_argument("--force-count", action="store_true")
+    p.add_argument(
+        "--suspects-file",
+        default=str(DEFAULT_SUSPECTS_FILE),
+        help="Valgfri liste med IFS/Oracle-tabeller som skal prioriteres først.",
+    )
     p.add_argument("--skip-oracle-profile", action="store_true")
     p.add_argument("--skip-dwh-profile", action="store_true")
     p.add_argument(
@@ -1449,12 +1725,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fingerprint-values-per-column", type=int, default=8)
     p.add_argument("--skip-value-search", action="store_true")
     p.add_argument("--oracle-value-search-limit-columns", type=int, default=2000)
+    p.add_argument(
+        "--initial-probes-per-dwh-column",
+        type=int,
+        default=1,
+        help="Antall særpregede DWH-verdier som søkes bredt før søket snevres inn.",
+    )
     p.add_argument("--probes-per-dwh-column", type=int, default=5)
     p.add_argument(
         "--max-hits-per-probe",
         type=int,
         default=100,
         help="Teller treff opp til denne grensen per DWH-verdi/IFS-kolonne.",
+    )
+    p.add_argument(
+        "--min-total-score",
+        type=float,
+        default=0.25,
+        help="Laveste totalscore for å ta med en IFS-kolonne som kandidat.",
     )
     return p.parse_args()
 
@@ -1467,6 +1755,13 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     local = init_local_db(DB_PATH)
+    suspects_path = resolve_config_path(args.suspects_file)
+    source_table_hints = load_source_table_hints(suspects_path)
+    store_source_table_hints(local, args.schemas, source_table_hints)
+    if source_table_hints:
+        print(f"Leste {len(source_table_hints)} prioriterte IFS-tabeller fra {suspects_path}.")
+    else:
+        print(f"Ingen prioriterte IFS-tabeller funnet i {suspects_path}.")
 
     if not args.skip_oracle_profile:
         print("Kobler til Oracle/IFS via OracleBaseCls ...")
@@ -1479,6 +1774,7 @@ def main() -> int:
                 min_rows=args.min_rows,
                 sample_rows=args.sample_rows,
                 force_count=args.force_count,
+                source_table_hints=source_table_hints,
             )
 
     if not args.skip_dwh_profile:
@@ -1511,11 +1807,12 @@ def main() -> int:
                 db=ora_db,
                 local=local,
                 max_oracle_columns=args.oracle_value_search_limit_columns,
+                initial_probes_per_dwh_column=args.initial_probes_per_dwh_column,
                 probes_per_dwh_column=args.probes_per_dwh_column,
                 max_hits_per_probe=args.max_hits_per_probe,
             )
 
-    build_mapping_candidates_with_value_hits(local)
+    build_mapping_candidates_with_value_hits(local, min_total_score=args.min_total_score)
     write_reports(local)
 
     print("")
