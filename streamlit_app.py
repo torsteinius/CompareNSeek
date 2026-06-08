@@ -112,16 +112,26 @@ def to_int(value: Any) -> int | None:
 
 def read_uploaded_csv(uploaded_file: Any) -> pd.DataFrame:
     data = uploaded_file.getvalue()
-    for sep in (";", ",", "\t"):
+    encodings = ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin1")
+    last_error: Exception | None = None
+
+    for encoding in encodings:
+        for sep in (";", ",", "\t"):
+            try:
+                df = pd.read_csv(io.BytesIO(data), sep=sep, encoding=encoding)
+            except (UnicodeDecodeError, UnicodeError, pd.errors.ParserError) as exc:
+                last_error = exc
+                continue
+            if len(df.columns) > 1:
+                return normalize_columns(df)
+
+    for encoding in encodings:
         try:
-            df = pd.read_csv(io.BytesIO(data), sep=sep, encoding="utf-8-sig")
-            if len(df.columns) > 1:
-                return normalize_columns(df)
-        except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(data), sep=sep, encoding="latin1")
-            if len(df.columns) > 1:
-                return normalize_columns(df)
-    return normalize_columns(pd.read_csv(io.BytesIO(data), encoding="utf-8-sig"))
+            return normalize_columns(pd.read_csv(io.BytesIO(data), encoding=encoding))
+        except (UnicodeDecodeError, UnicodeError, pd.errors.ParserError) as exc:
+            last_error = exc
+
+    raise ValueError(f"Could not read uploaded CSV/TXT file. Last error: {last_error}")
 
 
 @st.cache_resource

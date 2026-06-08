@@ -74,6 +74,7 @@ SAMPLE_DIR = OUT_DIR / "samples"
 
 DEFAULT_SCHEMAS: list[str] = ["IFSAPP"]
 DEFAULT_SUSPECTS_FILE = Path("suspects.txt")
+DEFAULT_DWH_PREFIX = "PFTSQL_"
 
 # Synonymer er generelle hjelperegler for navnematching. DWH-kolonnene leses fra databasen.
 SYNONYMS: dict[str, list[str]] = {
@@ -244,6 +245,16 @@ def resolve_config_path(path_value: str | Path) -> Path:
     return THIS_FILE.parent / path
 
 
+def read_text_lines(path: Path) -> list[str]:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin1"):
+        try:
+            return data.decode(encoding).splitlines()
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
 def load_source_table_hints(path: Path) -> list[SourceTableHint]:
     """
     Leser suspects.txt.
@@ -259,29 +270,28 @@ def load_source_table_hints(path: Path) -> list[SourceTableHint]:
 
     hints: list[SourceTableHint] = []
     seen: set[tuple[str | None, str]] = set()
-    with path.open("r", encoding="utf-8-sig") as f:
-        for raw_line in f:
-            line = raw_line.split("#", 1)[0].strip()
-            if not line:
-                continue
+    for raw_line in read_text_lines(path):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
 
-            owner: str | None = None
-            table_name = line
-            if "." in line:
-                owner_part, table_part = line.split(".", 1)
-                owner = owner_part.strip().strip('"[]').upper() or None
-                table_name = table_part
+        owner: str | None = None
+        table_name = line
+        if "." in line:
+            owner_part, table_part = line.split(".", 1)
+            owner = owner_part.strip().strip('"[]').upper() or None
+            table_name = table_part
 
-            table_name = table_name.strip().strip('"[]').upper()
-            if not table_name:
-                continue
+        table_name = table_name.strip().strip('"[]').upper()
+        if not table_name:
+            continue
 
-            key = (owner, table_name)
-            if key in seen:
-                continue
+        key = (owner, table_name)
+        if key in seen:
+            continue
 
-            seen.add(key)
-            hints.append(SourceTableHint(owner=owner, table_name=table_name, priority=len(hints) + 1))
+        seen.add(key)
+        hints.append(SourceTableHint(owner=owner, table_name=table_name, priority=len(hints) + 1))
 
     return hints
 
@@ -461,7 +471,7 @@ def connect_oracle(owner_default: str = "IFSAPP") -> OracleBaseCls:
     return OracleBaseCls(owner_default=owner_default)
 
 
-def connect_dwh(prefix: str = "") -> SqlServerBaseCls:
+def connect_dwh(prefix: str = DEFAULT_DWH_PREFIX) -> SqlServerBaseCls:
     return SqlServerBaseCls(prefix=prefix)
 
 
@@ -469,17 +479,16 @@ def load_setup_file(path: Path) -> None:
     if not path.exists():
         return
 
-    with path.open("r", encoding="utf-8-sig") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
+    for raw_line in read_text_lines(path):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
 
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and value and key not in os.environ:
-                os.environ[key] = value
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
 
 
 # =============================================================================
@@ -1706,7 +1715,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-dwh-profile", action="store_true")
     p.add_argument(
         "--dwh-prefix",
-        default=os.getenv("DWH_SQLSERVER_PREFIX", ""),
+        default=os.getenv("DWH_SQLSERVER_PREFIX", DEFAULT_DWH_PREFIX),
         help="Prefix for SQL Server config/secrets. Kan settes i setup.txt.",
     )
     p.add_argument("--dwh-schema", default=os.getenv("DWH_SCHEMA", "mart_m"))
