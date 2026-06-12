@@ -5,3 +5,5 @@
 ifs_profile_output/
 __pycache__/
 *.pyc
+ifs_knowledge/*
+!ifs_knowledge/README.md
