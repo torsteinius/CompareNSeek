@@ -1273,11 +1273,10 @@ def page_generic_db_search() -> None:
         if destination_db_type != "SQLite":
             st.warning("Denne database-typen er ikke koblet til generisk adapter ennå.")
 
-    settings = st.columns(4)
+    settings = st.columns(3)
     min_length = settings[0].number_input("Min tekstlengde", min_value=1, max_value=80, value=5)
     max_values_per_column = settings[1].number_input("Unike per kolonne", min_value=1, max_value=50, value=5)
     max_columns = settings[2].number_input("Maks kolonner", min_value=1, max_value=1000, value=100)
-    max_search_values = settings[3].number_input("Maks verdier å søke", min_value=1, max_value=1000, value=50)
 
     source_adapter = create_generic_adapter(source_db_type, source_db_path)
     destination_adapter = create_generic_adapter(destination_db_type, destination_db_path)
@@ -1324,6 +1323,11 @@ def page_generic_db_search() -> None:
             if unique_df.empty:
                 st.info("Fant ingen unike verdier med valgt filter.")
             else:
+                unique_df = unique_df.copy()
+                unique_df["value_choice"] = unique_df.apply(
+                    lambda row: f"{row['value']} | {row['source_field']} | score={row['fingerprint_score']}",
+                    axis=1,
+                )
                 st.dataframe(
                     unique_df[
                         [
@@ -1340,11 +1344,27 @@ def page_generic_db_search() -> None:
                     hide_index=True,
                 )
 
-                if st.button("2) Let etter disse verdiene"):
-                    hits_df = destination_engine.search_values(
-                        unique_df,
+                selected_value_label = st.selectbox(
+                    "Velg unik verdi fra listen",
+                    unique_df["value_choice"].tolist(),
+                )
+                selected_value_row = unique_df.loc[unique_df["value_choice"] == selected_value_label].iloc[0]
+                manual_value = st.text_input(
+                    "Verdi å lete etter",
+                    value=str(selected_value_row["value"]),
+                    help="Velg fra listen over eller lim inn en verdi fra et annet sted.",
+                )
+                manual_kind = st.selectbox(
+                    "Verditype",
+                    ["text", "number", "date"],
+                    index=["text", "number", "date"].index(str(selected_value_row.get("value_kind") or "text")),
+                )
+
+                if st.button("2) Let etter valgt verdi"):
+                    hits_df = destination_engine.search_single_value(
+                        manual_value,
+                        value_kind=manual_kind,
                         max_hits_per_column=100,
-                        max_search_values=int(max_search_values),
                         columns=selected_destination_columns,
                     )
                     st.session_state["generic_value_hits"] = hits_df
@@ -1358,14 +1378,10 @@ def page_generic_db_search() -> None:
                 st.dataframe(
                     hits_df[
                         [
-                            "value",
-                            "value_kind",
-                            "source_field",
-                            "hit_field",
-                            "hit_count",
-                            "same_column",
+                            "hit_table",
+                            "hit_column",
                         ]
-                    ],
+                    ].drop_duplicates(),
                     use_container_width=True,
                     hide_index=True,
                 )

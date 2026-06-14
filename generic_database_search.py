@@ -311,6 +311,33 @@ class GenericDatabaseSearch:
 
         return pd.DataFrame(rows)
 
+    def search_single_value(
+        self,
+        value: str,
+        value_kind: str = "text",
+        max_hits_per_column: int = 100,
+        columns: list[ColumnRef] | None = None,
+    ) -> pd.DataFrame:
+        source = ColumnRef(
+            database=self.adapter.database_name,
+            schema=None,
+            table="manual",
+            column="value",
+            data_type=value_kind,
+        )
+        unique = UniqueValue(
+            value=str(value),
+            value_kind=value_kind,
+            source=source,
+            occurrence_count=1,
+        )
+        return self.search_values(
+            [unique],
+            max_hits_per_column=max_hits_per_column,
+            max_search_values=1,
+            columns=columns,
+        )
+
 
 class SystematicDatabaseSearch:
     """
