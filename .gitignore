@@ -1,7 +1,9 @@
 *.txt
 !requirements.txt
 .env
+.venv/
 .git_nested_backup*/
+data/
 ifs_profile_output/
 __pycache__/
 *.pyc

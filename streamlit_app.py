@@ -16,10 +16,20 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from generic_database_search import (
+    ColumnRef,
+    DatabaseAdapter,
+    GenericDatabaseSearch,
+    SQLiteDatabaseAdapter,
+    create_random_sqlite_database,
+)
+
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "compare_seek.sqlite"
+GENERIC_TEST_DB_PATH = DATA_DIR / "generic_random_test.sqlite"
+DATABASE_TYPES = ["SQLite", "Oracle", "SQL Server"]
 
 TARGET_STATUSES = [
     "unknown",
@@ -1195,6 +1205,176 @@ def page_source_explorer() -> None:
             st.success("Manuell kandidat lagt til.")
 
 
+def create_generic_adapter(db_type: str, db_path: str) -> DatabaseAdapter | None:
+    if db_type == "SQLite":
+        path = Path(db_path).expanduser()
+        if not path.exists():
+            return None
+        return SQLiteDatabaseAdapter(path)
+    return None
+
+
+def select_generic_columns(
+    label: str,
+    columns: list[ColumnRef],
+    key_prefix: str,
+    allow_all_columns: bool = True,
+) -> list[ColumnRef]:
+    if not columns:
+        st.info(f"Ingen kolonner funnet for {label.lower()}.")
+        return []
+
+    tables = sorted({column.table for column in columns})
+    selected_table = st.selectbox(f"{label} tabell", ["Alle tabeller"] + tables, key=f"{key_prefix}_table")
+    table_columns = columns if selected_table == "Alle tabeller" else [c for c in columns if c.table == selected_table]
+
+    column_names = sorted({column.column for column in table_columns})
+    column_options = ["Alle kolonner"] + column_names if allow_all_columns else column_names
+    selected_column = st.selectbox(f"{label} kolonne", column_options, key=f"{key_prefix}_column")
+    if selected_column == "Alle kolonner":
+        return table_columns
+    return [c for c in table_columns if c.column == selected_column]
+
+
+def page_generic_db_search() -> None:
+    st.title("Micromanagement Search")
+    st.caption("Velg kilde for fingerprints og destinasjon for søk. Kilde og destinasjon kan være samme database.")
+
+    with st.expander("Testdata"):
+        c1, c2 = st.columns([2, 1])
+        test_db_path = c1.text_input("SQLite testdatabase", value=str(GENERIC_TEST_DB_PATH))
+        seed = c2.number_input("Random seed", min_value=1, max_value=999999, value=42, step=1)
+        if st.button("Lag random SQLite-testdatabase"):
+            path = create_random_sqlite_database(test_db_path, seed=int(seed))
+            st.success(f"Laget testdatabase: {path}")
+
+    source_panel, destination_panel = st.columns(2)
+    with source_panel:
+        st.subheader("Kilde")
+        source_db_type = st.selectbox("Kilde database type", DATABASE_TYPES, key="generic_source_type")
+        source_db_path = st.text_input("Kilde SQLite path", value=str(GENERIC_TEST_DB_PATH), key="generic_source_path")
+        if source_db_type != "SQLite":
+            st.warning("Denne database-typen er ikke koblet til generisk adapter ennå.")
+
+    with destination_panel:
+        st.subheader("Destinasjon")
+        destination_db_type = st.selectbox("Destinasjon database type", DATABASE_TYPES, key="generic_destination_type")
+        same_as_source = st.checkbox("Bruk samme database som kilde", value=True)
+        if same_as_source:
+            destination_db_type = source_db_type
+            destination_db_path = source_db_path
+            st.caption(destination_db_path)
+        else:
+            destination_db_path = st.text_input(
+                "Destinasjon SQLite path",
+                value=str(GENERIC_TEST_DB_PATH),
+                key="generic_destination_path",
+            )
+        if destination_db_type != "SQLite":
+            st.warning("Denne database-typen er ikke koblet til generisk adapter ennå.")
+
+    settings = st.columns(4)
+    min_length = settings[0].number_input("Min tekstlengde", min_value=1, max_value=80, value=5)
+    max_values_per_column = settings[1].number_input("Unike per kolonne", min_value=1, max_value=50, value=5)
+    max_columns = settings[2].number_input("Maks kolonner", min_value=1, max_value=1000, value=100)
+    max_search_values = settings[3].number_input("Maks verdier å søke", min_value=1, max_value=1000, value=50)
+
+    source_adapter = create_generic_adapter(source_db_type, source_db_path)
+    destination_adapter = create_generic_adapter(destination_db_type, destination_db_path)
+    if source_adapter is None:
+        st.info("Velg en eksisterende SQLite-fil som kilde, eller lag testdatabasen først.")
+        return
+    if destination_adapter is None:
+        st.info("Velg en eksisterende SQLite-fil som destinasjon.")
+        source_adapter.close()
+        return
+
+    try:
+        source_engine = GenericDatabaseSearch(source_adapter)
+        destination_engine = GenericDatabaseSearch(destination_adapter)
+        source_columns = source_adapter.list_columns()
+        destination_columns = destination_adapter.list_columns()
+
+        metric_cols = st.columns(2)
+        metric_cols[0].metric("Kildekolonner", len(source_columns))
+        metric_cols[1].metric("Destinasjonskolonner", len(destination_columns))
+
+        source_select, destination_select = st.columns(2)
+        with source_select:
+            selected_source_columns = select_generic_columns("Kilde", source_columns, "generic_source")
+        with destination_select:
+            selected_destination_columns = select_generic_columns(
+                "Destinasjon",
+                destination_columns,
+                "generic_destination",
+            )
+
+        if st.button("1) Finn unike verdier"):
+            unique_df = source_engine.find_unique_values(
+                min_length=int(min_length),
+                max_values_per_column=int(max_values_per_column),
+                max_columns=int(max_columns),
+                columns=selected_source_columns,
+            )
+            st.session_state["generic_unique_values"] = unique_df
+
+        unique_df = st.session_state.get("generic_unique_values")
+        if unique_df is not None:
+            st.subheader("Unike verdier")
+            if unique_df.empty:
+                st.info("Fant ingen unike verdier med valgt filter.")
+            else:
+                st.dataframe(
+                    unique_df[
+                        [
+                            "value",
+                            "value_kind",
+                            "source_field",
+                            "source_data_type",
+                            "occurrence_count",
+                            "value_length",
+                            "fingerprint_score",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                if st.button("2) Let etter disse verdiene"):
+                    hits_df = destination_engine.search_values(
+                        unique_df,
+                        max_hits_per_column=100,
+                        max_search_values=int(max_search_values),
+                        columns=selected_destination_columns,
+                    )
+                    st.session_state["generic_value_hits"] = hits_df
+
+        hits_df = st.session_state.get("generic_value_hits")
+        if hits_df is not None:
+            st.subheader("Treff")
+            if hits_df.empty:
+                st.info("Ingen treff funnet.")
+            else:
+                st.dataframe(
+                    hits_df[
+                        [
+                            "value",
+                            "value_kind",
+                            "source_field",
+                            "hit_field",
+                            "hit_count",
+                            "same_column",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    finally:
+        source_adapter.close()
+        if destination_adapter is not source_adapter:
+            destination_adapter.close()
+
+
 def page_export() -> None:
     st.title("Export")
     mode = st.selectbox(
@@ -1223,6 +1403,7 @@ def main() -> None:
         "Field Detail": page_field_detail,
         "Gap List": page_gap_list,
         "Source Explorer": page_source_explorer,
+        "Micromanagement Search": page_generic_db_search,
         "Export": page_export,
     }
     default_page = st.session_state.get("page", "Dashboard")
