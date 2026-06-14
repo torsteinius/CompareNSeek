@@ -30,6 +30,8 @@ DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "compare_seek.sqlite"
 GENERIC_TEST_DB_PATH = DATA_DIR / "generic_random_test.sqlite"
 DATABASE_TYPES = ["SQLite", "Oracle", "SQL Server"]
+CONNECTION_SYSTEMS = ["SQLite", "IFS", "DWH", "Lydia", "Custom"]
+CONNECTION_ENVIRONMENTS = ["local", "test", "preprod", "prod", "custom"]
 
 TARGET_STATUSES = [
     "unknown",
@@ -241,9 +243,26 @@ def init_db() -> None:
             status TEXT,
             message TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS connection_profile (
+            connection_profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            db_type TEXT NOT NULL,
+            system_name TEXT NOT NULL DEFAULT 'Custom',
+            environment TEXT NOT NULL DEFAULT 'custom',
+            sqlite_path TEXT,
+            config_prefix TEXT,
+            default_schema TEXT,
+            oracle_owner TEXT,
+            notes TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
+        );
         """
     )
     con.commit()
+    ensure_default_connection_profiles()
 
 
 def query_df(sql: str, params: tuple[Any, ...] = ()) -> pd.DataFrame:
@@ -254,6 +273,105 @@ def scalar(sql: str, params: tuple[Any, ...] = ()) -> Any:
     cur = get_connection().execute(sql, params)
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def ensure_default_connection_profiles() -> None:
+    con = get_connection()
+    con.execute(
+        """
+        INSERT OR IGNORE INTO connection_profile (
+            name, db_type, system_name, environment, sqlite_path, notes, is_active
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        """,
+        (
+            "Local SQLite testdata",
+            "SQLite",
+            "SQLite",
+            "local",
+            str(GENERIC_TEST_DB_PATH),
+            "Default lokal testdatabase for micromanagement-sok.",
+        ),
+    )
+    con.commit()
+
+
+def get_connection_profiles(active_only: bool = True, db_type: str | None = None) -> pd.DataFrame:
+    where = []
+    params: list[Any] = []
+    if active_only:
+        where.append("is_active = 1")
+    if db_type:
+        where.append("db_type = ?")
+        params.append(db_type)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return query_df(
+        f"""
+        SELECT *
+        FROM connection_profile
+        {where_sql}
+        ORDER BY
+            CASE environment
+                WHEN 'local' THEN 1
+                WHEN 'test' THEN 2
+                WHEN 'preprod' THEN 3
+                WHEN 'prod' THEN 4
+                ELSE 9
+            END,
+            system_name,
+            name
+        """,
+        tuple(params),
+    )
+
+
+def upsert_connection_profile(values: dict[str, Any]) -> None:
+    con = get_connection()
+    con.execute(
+        """
+        INSERT INTO connection_profile (
+            name, db_type, system_name, environment, sqlite_path, config_prefix,
+            default_schema, oracle_owner, notes, is_active
+        )
+        VALUES (
+            :name, :db_type, :system_name, :environment, :sqlite_path, :config_prefix,
+            :default_schema, :oracle_owner, :notes, :is_active
+        )
+        ON CONFLICT(name) DO UPDATE SET
+            db_type = excluded.db_type,
+            system_name = excluded.system_name,
+            environment = excluded.environment,
+            sqlite_path = excluded.sqlite_path,
+            config_prefix = excluded.config_prefix,
+            default_schema = excluded.default_schema,
+            oracle_owner = excluded.oracle_owner,
+            notes = excluded.notes,
+            is_active = excluded.is_active,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        values,
+    )
+    con.commit()
+
+
+def set_connection_profile_active(connection_profile_id: int, is_active: bool) -> None:
+    get_connection().execute(
+        """
+        UPDATE connection_profile
+        SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE connection_profile_id = ?
+        """,
+        (1 if is_active else 0, connection_profile_id),
+    )
+    get_connection().commit()
+
+
+def connection_profile_label(row: pd.Series | dict[str, Any]) -> str:
+    name = row["name"]
+    db_type = row["db_type"]
+    system_name = row.get("system_name") if isinstance(row, dict) else row["system_name"]
+    environment = row.get("environment") if isinstance(row, dict) else row["environment"]
+    return f"{name} ({system_name}/{environment}/{db_type})"
 
 
 def upsert_target_field(row: dict[str, Any]) -> int:
@@ -1205,13 +1323,99 @@ def page_source_explorer() -> None:
             st.success("Manuell kandidat lagt til.")
 
 
-def create_generic_adapter(db_type: str, db_path: str) -> DatabaseAdapter | None:
+def create_generic_adapter(profile: dict[str, Any]) -> DatabaseAdapter | None:
+    db_type = profile.get("db_type")
     if db_type == "SQLite":
-        path = Path(db_path).expanduser()
+        path = Path(profile.get("sqlite_path") or "").expanduser()
         if not path.exists():
             return None
         return SQLiteDatabaseAdapter(path)
     return None
+
+
+def profile_from_label(profiles: pd.DataFrame, label: str) -> dict[str, Any] | None:
+    if profiles.empty:
+        return None
+    labels = {connection_profile_label(row): row.to_dict() for _, row in profiles.iterrows()}
+    return labels.get(label)
+
+
+def page_connections() -> None:
+    st.title("Connections")
+    st.caption("Holder styr pa navngitte databaseprofiler. Hemmeligheter lagres fortsatt i miljo/setup, ikke i GUI-et.")
+
+    profiles = get_connection_profiles(active_only=False)
+    if profiles.empty:
+        st.info("Ingen connection-profiler finnes enna.")
+    else:
+        show = profiles[
+            [
+                "connection_profile_id",
+                "name",
+                "db_type",
+                "system_name",
+                "environment",
+                "sqlite_path",
+                "config_prefix",
+                "default_schema",
+                "oracle_owner",
+                "is_active",
+                "notes",
+            ]
+        ].copy()
+        show["is_active"] = show["is_active"].astype(bool)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.subheader("Legg til eller oppdater")
+    with st.form("connection_profile_form"):
+        c1, c2, c3 = st.columns(3)
+        name = c1.text_input("Navn", value="Local SQLite testdata")
+        db_type = c2.selectbox("Database type", DATABASE_TYPES)
+        system_name = c3.selectbox("System", CONNECTION_SYSTEMS)
+
+        c4, c5, c6 = st.columns(3)
+        environment = c4.selectbox("Miljo", CONNECTION_ENVIRONMENTS)
+        config_prefix = c5.text_input("Config prefix", help="For SQL Server kan dette matche prefix i SqlServerBaseCls, f.eks. PFTSQL_.")
+        default_schema = c6.text_input("Default schema")
+
+        sqlite_path = st.text_input("SQLite path", value=str(GENERIC_TEST_DB_PATH))
+        oracle_owner = st.text_input("Oracle owner", value="IFSAPP", help="Brukes som owner_default for Oracle/IFS-profiler.")
+        notes = st.text_area("Notater", height=80)
+        is_active = st.checkbox("Aktiv", value=True)
+
+        if st.form_submit_button("Lagre connection"):
+            if not name.strip():
+                st.error("Navn er pakrevd.")
+            else:
+                upsert_connection_profile(
+                    {
+                        "name": name.strip(),
+                        "db_type": db_type,
+                        "system_name": system_name,
+                        "environment": environment,
+                        "sqlite_path": sqlite_path.strip() if db_type == "SQLite" else None,
+                        "config_prefix": config_prefix.strip() or None,
+                        "default_schema": default_schema.strip() or None,
+                        "oracle_owner": oracle_owner.strip() or None,
+                        "notes": notes.strip() or None,
+                        "is_active": 1 if is_active else 0,
+                    }
+                )
+                st.success("Connection lagret.")
+                rerun()
+
+    profiles = get_connection_profiles(active_only=False)
+    if not profiles.empty:
+        with st.expander("Aktiver/deaktiver"):
+            labels = {connection_profile_label(row): int(row["connection_profile_id"]) for _, row in profiles.iterrows()}
+            selected = st.selectbox("Connection", list(labels.keys()))
+            b1, b2 = st.columns(2)
+            if b1.button("Aktiver"):
+                set_connection_profile_active(labels[selected], True)
+                rerun()
+            if b2.button("Deaktiver"):
+                set_connection_profile_active(labels[selected], False)
+                rerun()
 
 
 def select_generic_columns(
@@ -1249,42 +1453,43 @@ def page_generic_db_search() -> None:
             st.success(f"Laget testdatabase: {path}")
 
     source_panel, destination_panel = st.columns(2)
+    active_profiles = get_connection_profiles(active_only=True)
+    if active_profiles.empty:
+        st.info("Legg inn minst en aktiv connection pa Connections-siden.")
+        return
+    profile_labels = [connection_profile_label(row) for _, row in active_profiles.iterrows()]
+
     with source_panel:
         st.subheader("Kilde")
-        source_db_type = st.selectbox("Kilde database type", DATABASE_TYPES, key="generic_source_type")
-        source_db_path = st.text_input("Kilde SQLite path", value=str(GENERIC_TEST_DB_PATH), key="generic_source_path")
-        if source_db_type != "SQLite":
-            st.warning("Denne database-typen er ikke koblet til generisk adapter ennå.")
+        source_label = st.selectbox("Kilde connection", profile_labels, key="generic_source_profile")
+        source_profile = profile_from_label(active_profiles, source_label)
 
     with destination_panel:
         st.subheader("Destinasjon")
-        destination_db_type = st.selectbox("Destinasjon database type", DATABASE_TYPES, key="generic_destination_type")
         same_as_source = st.checkbox("Bruk samme database som kilde", value=True)
         if same_as_source:
-            destination_db_type = source_db_type
-            destination_db_path = source_db_path
-            st.caption(destination_db_path)
+            destination_profile = source_profile
+            st.caption(source_label)
         else:
-            destination_db_path = st.text_input(
-                "Destinasjon SQLite path",
-                value=str(GENERIC_TEST_DB_PATH),
-                key="generic_destination_path",
-            )
-        if destination_db_type != "SQLite":
-            st.warning("Denne database-typen er ikke koblet til generisk adapter ennå.")
+            destination_label = st.selectbox("Destinasjon connection", profile_labels, key="generic_destination_profile")
+            destination_profile = profile_from_label(active_profiles, destination_label)
 
     settings = st.columns(3)
     min_length = settings[0].number_input("Min tekstlengde", min_value=1, max_value=80, value=5)
     max_values_per_column = settings[1].number_input("Unike per kolonne", min_value=1, max_value=50, value=5)
     max_columns = settings[2].number_input("Maks kolonner", min_value=1, max_value=1000, value=100)
 
-    source_adapter = create_generic_adapter(source_db_type, source_db_path)
-    destination_adapter = create_generic_adapter(destination_db_type, destination_db_path)
+    if not source_profile or not destination_profile:
+        st.info("Velg kilde og destinasjon.")
+        return
+
+    source_adapter = create_generic_adapter(source_profile)
+    destination_adapter = create_generic_adapter(destination_profile)
     if source_adapter is None:
-        st.info("Velg en eksisterende SQLite-fil som kilde, eller lag testdatabasen først.")
+        st.info("Kildeprofilen kan ikke apnes enna. For na er bare SQLite-adapteren aktiv.")
         return
     if destination_adapter is None:
-        st.info("Velg en eksisterende SQLite-fil som destinasjon.")
+        st.info("Destinasjonsprofilen kan ikke apnes enna. For na er bare SQLite-adapteren aktiv.")
         source_adapter.close()
         return
 
@@ -1414,6 +1619,7 @@ def main() -> None:
 
     pages = {
         "Dashboard": page_dashboard,
+        "Connections": page_connections,
         "Import": page_import,
         "Table Explorer": page_table_explorer,
         "Field Detail": page_field_detail,
@@ -1423,6 +1629,8 @@ def main() -> None:
         "Export": page_export,
     }
     default_page = st.session_state.get("page", "Dashboard")
+    if default_page not in pages:
+        default_page = "Dashboard"
     selected_page = st.sidebar.radio("Navigasjon", list(pages.keys()), index=list(pages.keys()).index(default_page))
     st.session_state["page"] = selected_page
     st.sidebar.caption(f"Database: {DB_PATH.relative_to(APP_DIR)}")
