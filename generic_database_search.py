@@ -266,6 +266,187 @@ class SQLiteDatabaseAdapter(DatabaseAdapter):
         return int(rows["hit_count"]) if rows else 0
 
 
+class SQLServerDatabaseAdapter(DatabaseAdapter):
+    def __init__(self, db: Any, prefix: str | None = None, default_schema: str | None = None):
+        self.db = db
+        self.conn = getattr(db, "conn", db)
+        self.prefix = prefix or ""
+        self.default_schema = default_schema or getattr(db, "default_schema", None) or "dbo"
+        self.database_name = self._database_name()
+
+    def close(self) -> None:
+        close = getattr(self.db, "close", None)
+        if callable(close):
+            close()
+
+    def _database_name(self) -> str:
+        try:
+            row = lower_columns(pd.read_sql("SELECT DB_NAME() AS database_name", self.conn)).iloc[0]
+            return str(row["database_name"])
+        except Exception:
+            return self.prefix.rstrip("_") or "SQL Server"
+
+    def list_columns(self) -> list[ColumnRef]:
+        sql = """
+            SELECT
+                TABLE_CATALOG AS database_name,
+                TABLE_SCHEMA AS schema_name,
+                TABLE_NAME AS table_name,
+                COLUMN_NAME AS column_name,
+                DATA_TYPE AS data_type
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = ?
+              AND DATA_TYPE NOT IN ('binary', 'varbinary', 'image', 'timestamp', 'rowversion', 'xml', 'geography', 'geometry', 'hierarchyid')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+        """
+        rows = lower_columns(pd.read_sql(sql, self.conn, params=[self.default_schema]))
+        return [
+            ColumnRef(
+                database=str(row.database_name or self.database_name),
+                schema=str(row.schema_name),
+                table=str(row.table_name),
+                column=str(row.column_name),
+                data_type=str(row.data_type or ""),
+            )
+            for row in rows.itertuples(index=False)
+        ]
+
+    def find_unique_values_in_column(
+        self,
+        column: ColumnRef,
+        min_length: int,
+        limit: int,
+    ) -> list[UniqueValue]:
+        kind = value_kind(column.data_type)
+        table_sql = sqlserver_table_ident(column.schema, column.table)
+        col_sql = sqlserver_ident(column.column)
+        sql = f"""
+            SELECT TOP ({max(1, int(limit) * 50)})
+                CAST({col_sql} AS nvarchar(4000)) AS value_text,
+                COUNT_BIG(*) AS occurrence_count
+            FROM {table_sql}
+            WHERE {col_sql} IS NOT NULL
+              AND LTRIM(RTRIM(CAST({col_sql} AS nvarchar(4000)))) <> ''
+            GROUP BY {col_sql}
+            HAVING COUNT_BIG(*) = 1
+            ORDER BY
+                CASE WHEN LEN(CAST({col_sql} AS nvarchar(4000))) >= ? THEN 0 ELSE 1 END,
+                ABS(LEN(CAST({col_sql} AS nvarchar(4000))) - 24),
+                value_text
+        """
+        rows = lower_columns(pd.read_sql(sql, self.conn, params=[int(min_length)]))
+        return score_unique_rows(rows, column, kind, min_length, limit)
+
+    def count_value_hits(self, column: ColumnRef, value: str, value_kind: str, max_hits: int) -> int:
+        if value_kind != value_kind_for_column(column):
+            return 0
+        table_sql = sqlserver_table_ident(column.schema, column.table)
+        col_sql = sqlserver_ident(column.column)
+        sql = f"""
+            SELECT COUNT_BIG(*) AS hit_count
+            FROM (
+                SELECT TOP ({int(max_hits) + 1}) 1 AS hit_marker
+                FROM {table_sql}
+                WHERE CAST({col_sql} AS nvarchar(4000)) = ?
+            ) hits
+        """
+        rows = lower_columns(pd.read_sql(sql, self.conn, params=[str(value)]))
+        return int(rows.iloc[0]["hit_count"]) if not rows.empty else 0
+
+
+class OracleDatabaseAdapter(DatabaseAdapter):
+    def __init__(self, db: Any, owner: str | None = None):
+        self.db = db
+        self.conn = getattr(db, "conn", db)
+        self.owner = (owner or getattr(db, "owner_default", None) or "IFSAPP").upper()
+        self.database_name = self._database_name()
+
+    def close(self) -> None:
+        close = getattr(self.db, "close", None)
+        if callable(close):
+            close()
+
+    def _database_name(self) -> str:
+        try:
+            row = lower_columns(pd.read_sql("SELECT ora_database_name AS database_name FROM dual", self.conn)).iloc[0]
+            return str(row["database_name"])
+        except Exception:
+            return "Oracle"
+
+    def list_columns(self) -> list[ColumnRef]:
+        sql = """
+            SELECT
+                OWNER AS schema_name,
+                TABLE_NAME AS table_name,
+                COLUMN_NAME AS column_name,
+                DATA_TYPE AS data_type
+            FROM ALL_TAB_COLUMNS
+            WHERE OWNER = :owner
+              AND DATA_TYPE NOT IN ('BLOB', 'CLOB', 'NCLOB', 'BFILE', 'LONG', 'RAW', 'LONG RAW', 'XMLTYPE')
+            ORDER BY OWNER, TABLE_NAME, COLUMN_ID
+        """
+        rows = lower_columns(pd.read_sql(sql, self.conn, params={"owner": self.owner}))
+        return [
+            ColumnRef(
+                database=self.database_name,
+                schema=str(row.schema_name),
+                table=str(row.table_name),
+                column=str(row.column_name),
+                data_type=str(row.data_type or ""),
+            )
+            for row in rows.itertuples(index=False)
+        ]
+
+    def find_unique_values_in_column(
+        self,
+        column: ColumnRef,
+        min_length: int,
+        limit: int,
+    ) -> list[UniqueValue]:
+        kind = value_kind(column.data_type)
+        table_sql = oracle_table_ident(column.schema, column.table)
+        col_sql = oracle_ident(column.column)
+        sql = f"""
+            SELECT value_text, occurrence_count
+            FROM (
+                SELECT
+                    TO_CHAR({col_sql}) AS value_text,
+                    COUNT(*) AS occurrence_count
+                FROM {table_sql}
+                WHERE {col_sql} IS NOT NULL
+                  AND TRIM(TO_CHAR({col_sql})) IS NOT NULL
+                GROUP BY {col_sql}
+                HAVING COUNT(*) = 1
+                ORDER BY
+                    CASE WHEN LENGTH(TO_CHAR({col_sql})) >= :min_length THEN 0 ELSE 1 END,
+                    ABS(LENGTH(TO_CHAR({col_sql})) - 24),
+                    value_text
+            )
+            WHERE ROWNUM <= :limit
+        """
+        rows = lower_columns(
+            pd.read_sql(sql, self.conn, params={"min_length": int(min_length), "limit": max(1, int(limit) * 50)})
+        )
+        return score_unique_rows(rows, column, kind, min_length, limit)
+
+    def count_value_hits(self, column: ColumnRef, value: str, value_kind: str, max_hits: int) -> int:
+        if value_kind != value_kind_for_column(column):
+            return 0
+        table_sql = oracle_table_ident(column.schema, column.table)
+        col_sql = oracle_ident(column.column)
+        sql = f"""
+            SELECT COUNT(*) AS hit_count
+            FROM (
+                SELECT 1
+                FROM {table_sql}
+                WHERE TO_CHAR({col_sql}) = :value
+                  AND ROWNUM <= :max_hits
+            )
+        """
+        rows = lower_columns(pd.read_sql(sql, self.conn, params={"value": str(value), "max_hits": int(max_hits) + 1}))
+        return int(rows.iloc[0]["hit_count"]) if not rows.empty else 0
+
+
 class GenericDatabaseSearch:
     """Find distinctive values in one database, then search for them broadly."""
 
@@ -456,6 +637,60 @@ def normalize_search_values(values: pd.DataFrame | Iterable[UniqueValue | dict[s
 
 def sqlite_ident(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def lower_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(column).lower() for column in df.columns]
+    return df
+
+
+def sqlserver_ident(value: str) -> str:
+    return "[" + value.replace("]", "]]") + "]"
+
+
+def sqlserver_table_ident(schema: str | None, table: str) -> str:
+    if schema:
+        return f"{sqlserver_ident(schema)}.{sqlserver_ident(table)}"
+    return sqlserver_ident(table)
+
+
+def oracle_ident(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def oracle_table_ident(schema: str | None, table: str) -> str:
+    if schema:
+        return f"{oracle_ident(schema)}.{oracle_ident(table)}"
+    return oracle_ident(table)
+
+
+def score_unique_rows(
+    rows: pd.DataFrame,
+    column: ColumnRef,
+    kind: str,
+    min_length: int,
+    limit: int,
+) -> list[UniqueValue]:
+    candidates: list[tuple[float, UniqueValue]] = []
+    for row in rows.itertuples(index=False):
+        value = str(getattr(row, "value_text", "") or "")
+        score = fingerprint_score(value, kind, min_length)
+        if score <= 0:
+            continue
+        candidates.append(
+            (
+                score,
+                UniqueValue(
+                    value=value,
+                    value_kind=kind,
+                    source=column,
+                    occurrence_count=int(getattr(row, "occurrence_count", 1) or 1),
+                ),
+            )
+        )
+    candidates.sort(key=lambda item: (-item[0], item[1].value))
+    return [value for _score, value in candidates[:limit]]
 
 
 def create_random_sqlite_database(path: str | Path, seed: int = 42) -> Path:

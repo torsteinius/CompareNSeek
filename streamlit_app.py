@@ -9,7 +9,12 @@ Run:
 from __future__ import annotations
 
 import io
+import importlib.metadata as importlib_metadata
+import importlib.util
+import os
+import platform
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +25,9 @@ from generic_database_search import (
     ColumnRef,
     DatabaseAdapter,
     GenericDatabaseSearch,
+    OracleDatabaseAdapter,
     SQLiteDatabaseAdapter,
+    SQLServerDatabaseAdapter,
     create_random_sqlite_database,
 )
 
@@ -71,6 +78,74 @@ STATUS_ICON = {
 }
 
 MANUAL_MATCH_STATUSES = {"confirmed", "rejected", "preferred_candidate", "needs_review", "manual_candidate"}
+
+
+def load_key_value_file(path: Path, override: bool = False) -> None:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (override or key not in os.environ):
+                os.environ[key] = value
+
+
+def bootstrap_local_environment() -> None:
+    load_key_value_file(APP_DIR / ".env")
+    load_key_value_file(APP_DIR / "setup.txt")
+
+
+def ensure_divclasses_on_syspath() -> None:
+    if any((Path(path) / "DivClasses").exists() for path in sys.path if path):
+        return
+
+    for parent in (APP_DIR, *APP_DIR.parents):
+        try:
+            siblings = [p for p in parent.iterdir() if p.is_dir()]
+        except OSError:
+            siblings = []
+        candidates = [parent, *siblings]
+        for candidate in candidates:
+            if (candidate / "DivClasses").exists():
+                candidate_text = str(candidate)
+                if candidate_text not in sys.path:
+                    sys.path.insert(0, candidate_text)
+                return
+
+
+def env_miljo_value(environment: Any) -> str:
+    value = str(environment or "test").strip().upper()
+    aliases = {
+        "LOCAL": "LOCAL",
+        "TEST": "TEST",
+        "PREPROD": "PREPROD",
+        "PROD": "PROD",
+        "CUSTOM": "CUSTOM",
+    }
+    return aliases.get(value, value or "TEST")
+
+
+def profile_secret_prefix(profile: dict[str, Any]) -> str:
+    configured = str(profile.get("config_prefix") or "").strip()
+    if configured:
+        return configured if configured.endswith("_") else f"{configured}_"
+    if profile.get("db_type") == "Oracle":
+        return "ORACLE_"
+    system_name = str(profile.get("system_name") or "").strip()
+    return f"{system_name.upper()}_" if system_name else ""
+
+
+def configure_profile_environment(profile: dict[str, Any]) -> None:
+    prefix = profile_secret_prefix(profile)
+    if not prefix:
+        return
+    miljo_key = f"{prefix}MILJO"
+    os.environ[miljo_key] = env_miljo_value(profile.get("environment"))
 
 
 def now_sql() -> str:
@@ -277,21 +352,118 @@ def scalar(sql: str, params: tuple[Any, ...] = ()) -> Any:
 
 def ensure_default_connection_profiles() -> None:
     con = get_connection()
-    con.execute(
+    default_profiles = [
+        {
+            "name": "Local SQLite testdata",
+            "db_type": "SQLite",
+            "system_name": "SQLite",
+            "environment": "local",
+            "sqlite_path": str(GENERIC_TEST_DB_PATH),
+            "config_prefix": None,
+            "default_schema": None,
+            "oracle_owner": None,
+            "notes": "Default lokal testdatabase for micromanagement-sok.",
+            "is_active": 1,
+        },
+        {
+            "name": "IFS Oracle",
+            "db_type": "Oracle",
+            "system_name": "IFS",
+            "environment": "test",
+            "sqlite_path": None,
+            "config_prefix": "ORACLE_",
+            "default_schema": None,
+            "oracle_owner": "IFSAPP",
+            "notes": "Bruker DivClasses.OracleBaseCls; secrets hentes av klassen/servermiljoet.",
+            "is_active": 1,
+        },
+        {
+            "name": "IFS Oracle preprod",
+            "db_type": "Oracle",
+            "system_name": "IFS",
+            "environment": "preprod",
+            "sqlite_path": None,
+            "config_prefix": "ORACLE2_",
+            "default_schema": None,
+            "oracle_owner": "IFSAPP",
+            "notes": "Preprod IFS via ORACLE2_. Ligger i secrets, men passord kan vaere uavklart.",
+            "is_active": 0,
+        },
+        {
+            "name": "DWH SQL Server",
+            "db_type": "SQL Server",
+            "system_name": "DWH",
+            "environment": "test",
+            "sqlite_path": None,
+            "config_prefix": "PFTSQL_",
+            "default_schema": "mart_m",
+            "oracle_owner": None,
+            "notes": "Bruker DivClasses.SQLServerBaseCls med prefix PFTSQL_.",
+            "is_active": 1,
+        },
+        {
+            "name": "Lydia SQL Server",
+            "db_type": "SQL Server",
+            "system_name": "Lydia",
+            "environment": "prod",
+            "sqlite_path": None,
+            "config_prefix": "LYDIA_",
+            "default_schema": None,
+            "oracle_owner": None,
+            "notes": "Bruker DivClasses.SQLServerBaseCls med Lydia-prefix fra serverens secrets.",
+            "is_active": 1,
+        },
+    ]
+    con.executemany(
         """
         INSERT OR IGNORE INTO connection_profile (
-            name, db_type, system_name, environment, sqlite_path, notes, is_active
+            name, db_type, system_name, environment, sqlite_path, config_prefix,
+            default_schema, oracle_owner, notes, is_active
         )
-        VALUES (?, ?, ?, ?, ?, ?, 1)
+        VALUES (
+            :name, :db_type, :system_name, :environment, :sqlite_path, :config_prefix,
+            :default_schema, :oracle_owner, :notes, :is_active
+        )
         """,
-        (
-            "Local SQLite testdata",
-            "SQLite",
-            "SQLite",
-            "local",
-            str(GENERIC_TEST_DB_PATH),
-            "Default lokal testdatabase for micromanagement-sok.",
-        ),
+        default_profiles,
+    )
+    con.executemany(
+        """
+        UPDATE connection_profile
+        SET environment = ?,
+            config_prefix = ?,
+            is_active = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE name = ?
+          AND system_name = ?
+          AND notes = ?
+        """,
+        [
+            (
+                "test",
+                "ORACLE_",
+                1,
+                "IFS Oracle",
+                "IFS",
+                "Bruker DivClasses.OracleBaseCls; secrets hentes av klassen/servermiljoet.",
+            ),
+            (
+                "test",
+                "PFTSQL_",
+                1,
+                "DWH SQL Server",
+                "DWH",
+                "Bruker DivClasses.SQLServerBaseCls med prefix PFTSQL_.",
+            ),
+            (
+                "prod",
+                "LYDIA_",
+                1,
+                "Lydia SQL Server",
+                "Lydia",
+                "Bruker DivClasses.SQLServerBaseCls med Lydia-prefix fra serverens secrets.",
+            ),
+        ],
     )
     con.commit()
 
@@ -1324,12 +1496,41 @@ def page_source_explorer() -> None:
 
 
 def create_generic_adapter(profile: dict[str, Any]) -> DatabaseAdapter | None:
+    bootstrap_local_environment()
+    configure_profile_environment(profile)
     db_type = profile.get("db_type")
     if db_type == "SQLite":
         path = Path(profile.get("sqlite_path") or "").expanduser()
         if not path.exists():
             return None
         return SQLiteDatabaseAdapter(path)
+    if db_type == "SQL Server":
+        ensure_divclasses_on_syspath()
+        try:
+            from DivClasses.SQLServerBase import SqlServerBaseCls
+        except ImportError as exc:
+            raise RuntimeError("Fant ikke DivClasses.SQLServerBase i dette miljoet.") from exc
+
+        prefix = profile_secret_prefix(profile)
+        db = SqlServerBaseCls(prefix=prefix)
+        db.connect()
+        return SQLServerDatabaseAdapter(
+            db,
+            prefix=prefix,
+            default_schema=getattr(db, "default_schema", None),
+        )
+    if db_type == "Oracle":
+        ensure_divclasses_on_syspath()
+        try:
+            from DivClasses.OracleBase import OracleBaseCls
+        except ImportError as exc:
+            raise RuntimeError("Fant ikke DivClasses.OracleBase i dette miljoet.") from exc
+
+        prefix = profile_secret_prefix(profile)
+        owner = str(profile.get("oracle_owner") or profile.get("default_schema") or "IFSAPP")
+        db = OracleBaseCls(prefix=prefix, owner_default=owner)
+        db.connect()
+        return OracleDatabaseAdapter(db, owner=owner)
     return None
 
 
@@ -1338,6 +1539,125 @@ def profile_from_label(profiles: pd.DataFrame, label: str) -> dict[str, Any] | N
         return None
     labels = {connection_profile_label(row): row.to_dict() for _, row in profiles.iterrows()}
     return labels.get(label)
+
+
+def test_connection_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    label = connection_profile_label(profile)
+    adapter: DatabaseAdapter | None = None
+    try:
+        adapter = create_generic_adapter(profile)
+        if adapter is None:
+            return {
+                "connection": label,
+                "status": "FEIL",
+                "message": "Profilen kunne ikke apnes. Sjekk sti/prefix/oppsett.",
+                "columns": None,
+            }
+
+        columns = adapter.list_columns()
+        return {
+            "connection": label,
+            "status": "OK",
+            "message": f"Koblet til {adapter.database_name}.",
+            "columns": len(columns),
+        }
+    except Exception as exc:
+        return {
+            "connection": label,
+            "status": "FEIL",
+            "message": str(exc),
+            "columns": None,
+        }
+    finally:
+        if adapter is not None:
+            adapter.close()
+
+
+def show_connection_status_panel(profiles: pd.DataFrame) -> None:
+    if profiles.empty:
+        return
+
+    st.subheader("Connection status")
+    labels = {connection_profile_label(row): row.to_dict() for _, row in profiles.iterrows()}
+    selected = st.selectbox("Test connection", list(labels.keys()), key="connection_status_profile")
+    c1, c2 = st.columns([1, 1])
+
+    if c1.button("Test valgt connection"):
+        st.session_state["connection_status_rows"] = [test_connection_profile(labels[selected])]
+
+    if c2.button("Test alle aktive"):
+        active_rows = [row.to_dict() for _, row in profiles[profiles["is_active"] == 1].iterrows()]
+        st.session_state["connection_status_rows"] = [test_connection_profile(row) for row in active_rows]
+
+    rows = st.session_state.get("connection_status_rows")
+    if rows:
+        status_df = pd.DataFrame(rows)
+        st.dataframe(status_df, use_container_width=True, hide_index=True)
+
+        failed = status_df[status_df["status"] != "OK"]
+        if failed.empty:
+            st.success("Alle testede connections svarer.")
+        else:
+            st.warning("En eller flere connections feilet. Se meldingene i tabellen.")
+            for row in failed.itertuples(index=False):
+                st.error(f"{row.connection}: {row.message}")
+
+
+def package_status_rows() -> list[dict[str, Any]]:
+    packages = [
+        ("streamlit", "streamlit", True, "Kjerneapp"),
+        ("pandas", "pandas", True, "Dataframes"),
+        ("oracledb", "oracledb", False, "Oracle-driver"),
+        ("cx_Oracle", "cx-Oracle", False, "Oracle-driver fallback"),
+        ("pyodbc", "pyodbc", False, "SQL Server-driver"),
+        ("pymssql", "pymssql", False, "SQL Server-driver fallback"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for module_name, package_name, required, purpose in packages:
+        found = importlib.util.find_spec(module_name) is not None
+        version = ""
+        if found:
+            try:
+                version = importlib_metadata.version(package_name)
+            except importlib_metadata.PackageNotFoundError:
+                version = "installert"
+        rows.append(
+            {
+                "status": "OK" if found else "Mangler",
+                "module": module_name,
+                "package": package_name,
+                "version": version,
+                "required": "Ja" if required else "Ved behov",
+                "purpose": purpose,
+            }
+        )
+    return rows
+
+
+def show_python_environment_panel() -> None:
+    with st.expander("Python/miljo-test", expanded=False):
+        rows = package_status_rows()
+        st.caption("Miljoet som faktisk kjorer denne Streamlit-appen.")
+        st.code(
+            "\n".join(
+                [
+                    f"Python: {sys.executable}",
+                    f"Versjon: {platform.python_version()}",
+                    f"Arbeidsmappe: {os.getcwd()}",
+                    f"Appfil: {APP_DIR / 'streamlit_app.py'}",
+                    f"Install: \"{sys.executable}\" -m pip install -r \"{APP_DIR / 'requirements.txt'}\"",
+                ]
+            ),
+            language="text",
+        )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        has_oracle_driver = any(row["status"] == "OK" for row in rows if row["module"] in {"oracledb", "cx_Oracle"})
+        has_mssql_driver = any(row["status"] == "OK" for row in rows if row["module"] in {"pyodbc", "pymssql"})
+        if not has_oracle_driver:
+            st.info("Oracle krever `oracledb` eller `cx_Oracle` i samme Python som kjorer Streamlit.")
+        if not has_mssql_driver:
+            st.info("SQL Server krever `pyodbc` eller `pymssql` i samme Python som kjorer Streamlit.")
 
 
 def page_connections() -> None:
@@ -1365,6 +1685,8 @@ def page_connections() -> None:
         ].copy()
         show["is_active"] = show["is_active"].astype(bool)
         st.dataframe(show, use_container_width=True, hide_index=True)
+        show_connection_status_panel(profiles)
+        show_python_environment_panel()
 
     st.subheader("Legg til eller oppdater")
     with st.form("connection_profile_form"):
@@ -1483,13 +1805,17 @@ def page_generic_db_search() -> None:
         st.info("Velg kilde og destinasjon.")
         return
 
-    source_adapter = create_generic_adapter(source_profile)
-    destination_adapter = create_generic_adapter(destination_profile)
+    try:
+        source_adapter = create_generic_adapter(source_profile)
+        destination_adapter = create_generic_adapter(destination_profile)
+    except Exception as exc:
+        st.error(f"Klarte ikke apne connection: {exc}")
+        return
     if source_adapter is None:
-        st.info("Kildeprofilen kan ikke apnes enna. For na er bare SQLite-adapteren aktiv.")
+        st.info("Kildeprofilen kan ikke apnes. Sjekk connection-profilen.")
         return
     if destination_adapter is None:
-        st.info("Destinasjonsprofilen kan ikke apnes enna. For na er bare SQLite-adapteren aktiv.")
+        st.info("Destinasjonsprofilen kan ikke apnes. Sjekk connection-profilen.")
         source_adapter.close()
         return
 
@@ -1590,6 +1916,8 @@ def page_generic_db_search() -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
+    except Exception as exc:
+        st.error(f"Soket stoppet: {exc}")
     finally:
         source_adapter.close()
         if destination_adapter is not source_adapter:
@@ -1614,6 +1942,7 @@ def page_export() -> None:
 
 
 def main() -> None:
+    bootstrap_local_environment()
     st.set_page_config(page_title="CompareNSeek", layout="wide")
     init_db()
 
