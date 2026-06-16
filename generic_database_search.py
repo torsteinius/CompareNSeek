@@ -61,6 +61,16 @@ class DatabaseAdapter(ABC):
     def list_columns(self) -> list[ColumnRef]:
         """Return searchable columns."""
 
+    def list_schemas(self) -> list[str]:
+        return []
+
+    def configure_metadata_filter(
+        self,
+        schema: str | None = None,
+        object_types: Iterable[str] | None = None,
+    ) -> None:
+        return None
+
     @abstractmethod
     def find_unique_values_in_column(
         self,
@@ -85,6 +95,18 @@ def value_kind(data_type: str | None) -> str:
     if any(token in dt for token in ("date", "time", "timestamp")):
         return "date"
     return "text"
+
+
+def unique_upper_values(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value).strip().upper()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
 
 
 def should_search_value(value: Any, kind: str, min_length: int) -> bool:
@@ -272,6 +294,7 @@ class SQLServerDatabaseAdapter(DatabaseAdapter):
         self.conn = getattr(db, "conn", db)
         self.prefix = prefix or ""
         self.default_schema = default_schema or getattr(db, "default_schema", None) or "dbo"
+        self.object_types = {"TABLE", "VIEW"}
         self.database_name = self._database_name()
 
     def close(self) -> None:
@@ -286,20 +309,56 @@ class SQLServerDatabaseAdapter(DatabaseAdapter):
         except Exception:
             return self.prefix.rstrip("_") or "SQL Server"
 
+    def list_schemas(self) -> list[str]:
+        rows = lower_columns(
+            pd.read_sql(
+                """
+                SELECT SCHEMA_NAME AS schema_name
+                FROM INFORMATION_SCHEMA.SCHEMATA
+                ORDER BY SCHEMA_NAME
+                """,
+                self.conn,
+            )
+        )
+        return [str(row.schema_name) for row in rows.itertuples(index=False)]
+
+    def configure_metadata_filter(
+        self,
+        schema: str | None = None,
+        object_types: Iterable[str] | None = None,
+    ) -> None:
+        if schema:
+            self.default_schema = schema
+        if object_types:
+            self.object_types = {str(item).upper() for item in object_types}
+
     def list_columns(self) -> list[ColumnRef]:
+        type_values = []
+        if "TABLE" in self.object_types:
+            type_values.append("BASE TABLE")
+        if "VIEW" in self.object_types:
+            type_values.append("VIEW")
+        if not type_values:
+            return []
+        type_filter = ",".join("?" for _ in type_values)
         sql = """
             SELECT
-                TABLE_CATALOG AS database_name,
-                TABLE_SCHEMA AS schema_name,
-                TABLE_NAME AS table_name,
-                COLUMN_NAME AS column_name,
-                DATA_TYPE AS data_type
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = ?
-              AND DATA_TYPE NOT IN ('binary', 'varbinary', 'image', 'timestamp', 'rowversion', 'xml', 'geography', 'geometry', 'hierarchyid')
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-        """
-        rows = lower_columns(pd.read_sql(sql, self.conn, params=[self.default_schema]))
+                c.TABLE_CATALOG AS database_name,
+                c.TABLE_SCHEMA AS schema_name,
+                c.TABLE_NAME AS table_name,
+                c.COLUMN_NAME AS column_name,
+                c.DATA_TYPE AS data_type
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            JOIN INFORMATION_SCHEMA.TABLES t
+              ON t.TABLE_CATALOG = c.TABLE_CATALOG
+             AND t.TABLE_SCHEMA = c.TABLE_SCHEMA
+             AND t.TABLE_NAME = c.TABLE_NAME
+            WHERE c.TABLE_SCHEMA = ?
+              AND t.TABLE_TYPE IN ({type_filter})
+              AND c.DATA_TYPE NOT IN ('binary', 'varbinary', 'image', 'timestamp', 'rowversion', 'xml', 'geography', 'geometry', 'hierarchyid')
+            ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
+        """.format(type_filter=type_filter)
+        rows = lower_columns(pd.read_sql(sql, self.conn, params=[self.default_schema, *type_values]))
         return [
             ColumnRef(
                 database=str(row.database_name or self.database_name),
@@ -355,10 +414,12 @@ class SQLServerDatabaseAdapter(DatabaseAdapter):
 
 
 class OracleDatabaseAdapter(DatabaseAdapter):
-    def __init__(self, db: Any, owner: str | None = None):
+    def __init__(self, db: Any, owner: str | None = None, table_names: Iterable[str] | None = None):
         self.db = db
         self.conn = getattr(db, "conn", db)
         self.owner = (owner or getattr(db, "owner_default", None) or "IFSAPP").upper()
+        self.table_names = unique_upper_values(table_names or [])
+        self.object_types = {"TABLE", "VIEW"}
         self.database_name = self._database_name()
 
     def close(self) -> None:
@@ -373,19 +434,79 @@ class OracleDatabaseAdapter(DatabaseAdapter):
         except Exception:
             return "Oracle"
 
+    def list_schemas(self) -> list[str]:
+        rows = lower_columns(
+            pd.read_sql(
+                """
+                SELECT DISTINCT OWNER AS schema_name
+                FROM ALL_TAB_COLUMNS
+                ORDER BY OWNER
+                """,
+                self.conn,
+            )
+        )
+        return [str(row.schema_name) for row in rows.itertuples(index=False)]
+
+    def configure_metadata_filter(
+        self,
+        schema: str | None = None,
+        object_types: Iterable[str] | None = None,
+    ) -> None:
+        if schema:
+            self.owner = schema.upper()
+        if object_types:
+            self.object_types = {str(item).upper() for item in object_types}
+
     def list_columns(self) -> list[ColumnRef]:
+        table_filter_sql = ""
+        params: dict[str, Any] = {"owner": self.owner}
+        if self.table_names:
+            bind_names = []
+            for idx, table_name in enumerate(self.table_names):
+                bind_name = f"table_{idx}"
+                bind_names.append(f":{bind_name}")
+                params[bind_name] = table_name
+            table_filter_sql = f" AND c.TABLE_NAME IN ({', '.join(bind_names)})"
+
+        object_types = sorted(self.object_types)
+        if not object_types:
+            return []
+        object_bind_names = []
+        for idx, object_type in enumerate(object_types):
+            bind_name = f"object_type_{idx}"
+            object_bind_names.append(f":{bind_name}")
+            params[bind_name] = object_type
+        object_type_filter_sql = f" AND o.OBJECT_TYPE IN ({', '.join(object_bind_names)})"
+
+        priority_order_sql = "c.TABLE_NAME"
+        if self.table_names:
+            cases = " ".join(
+                f"WHEN :table_{idx} THEN {idx}"
+                for idx, _table_name in enumerate(self.table_names)
+            )
+            priority_order_sql = f"CASE c.TABLE_NAME {cases} ELSE {len(self.table_names)} END, c.TABLE_NAME"
+
         sql = """
             SELECT
-                OWNER AS schema_name,
-                TABLE_NAME AS table_name,
-                COLUMN_NAME AS column_name,
-                DATA_TYPE AS data_type
-            FROM ALL_TAB_COLUMNS
-            WHERE OWNER = :owner
-              AND DATA_TYPE NOT IN ('BLOB', 'CLOB', 'NCLOB', 'BFILE', 'LONG', 'RAW', 'LONG RAW', 'XMLTYPE')
-            ORDER BY OWNER, TABLE_NAME, COLUMN_ID
-        """
-        rows = lower_columns(pd.read_sql(sql, self.conn, params={"owner": self.owner}))
+                c.OWNER AS schema_name,
+                c.TABLE_NAME AS table_name,
+                c.COLUMN_NAME AS column_name,
+                c.DATA_TYPE AS data_type
+            FROM ALL_TAB_COLUMNS c
+            JOIN ALL_OBJECTS o
+              ON o.OWNER = c.OWNER
+             AND o.OBJECT_NAME = c.TABLE_NAME
+            WHERE c.OWNER = :owner
+              {table_filter_sql}
+              {object_type_filter_sql}
+              AND c.DATA_TYPE NOT IN ('BLOB', 'CLOB', 'NCLOB', 'BFILE', 'LONG', 'RAW', 'LONG RAW', 'XMLTYPE')
+            ORDER BY c.OWNER, {priority_order_sql}, c.COLUMN_ID
+        """.format(
+            table_filter_sql=table_filter_sql,
+            object_type_filter_sql=object_type_filter_sql,
+            priority_order_sql=priority_order_sql,
+        )
+        rows = lower_columns(pd.read_sql(sql, self.conn, params=params))
         return [
             ColumnRef(
                 database=self.database_name,

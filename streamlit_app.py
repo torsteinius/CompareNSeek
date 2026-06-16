@@ -100,6 +100,48 @@ def bootstrap_local_environment() -> None:
     load_key_value_file(APP_DIR / "setup.txt")
 
 
+def read_text_lines(path: Path) -> list[str]:
+    data = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252", "latin1"):
+        try:
+            return data.decode(encoding).splitlines()
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
+def load_suspect_oracle_tables(owner: str = "IFSAPP") -> list[str]:
+    paths = [
+        APP_DIR / "ifs_knowledge" / "suspects.txt",
+        APP_DIR / "suspects.txt",
+    ]
+    owner = owner.upper()
+    tables: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        for raw_line in read_text_lines(path):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            line_owner: str | None = None
+            table_name = line
+            if "." in line:
+                owner_part, table_part = line.split(".", 1)
+                line_owner = owner_part.strip().strip('"[]').upper() or None
+                table_name = table_part
+            if line_owner is not None and line_owner != owner:
+                continue
+            table_name = table_name.strip().strip('"[]').upper()
+            if table_name and table_name not in seen:
+                seen.add(table_name)
+                tables.append(table_name)
+        if tables:
+            break
+    return tables
+
+
 def ensure_divclasses_on_syspath() -> None:
     if any((Path(path) / "DivClasses").exists() for path in sys.path if path):
         return
@@ -372,7 +414,7 @@ def ensure_default_connection_profiles() -> None:
             "environment": "test",
             "sqlite_path": None,
             "config_prefix": "ORACLE_",
-            "default_schema": None,
+            "default_schema": "IFSAPP",
             "oracle_owner": "IFSAPP",
             "notes": "Bruker DivClasses.OracleBaseCls; secrets hentes av klassen/servermiljoet.",
             "is_active": 1,
@@ -384,7 +426,7 @@ def ensure_default_connection_profiles() -> None:
             "environment": "preprod",
             "sqlite_path": None,
             "config_prefix": "ORACLE2_",
-            "default_schema": None,
+            "default_schema": "IFSAPP",
             "oracle_owner": "IFSAPP",
             "notes": "Preprod IFS via ORACLE2_. Ligger i secrets, men passord kan vaere uavklart.",
             "is_active": 0,
@@ -464,6 +506,16 @@ def ensure_default_connection_profiles() -> None:
                 "Bruker DivClasses.SQLServerBaseCls med Lydia-prefix fra serverens secrets.",
             ),
         ],
+    )
+    con.execute(
+        """
+        UPDATE connection_profile
+        SET default_schema = COALESCE(NULLIF(default_schema, ''), 'IFSAPP'),
+            oracle_owner = COALESCE(NULLIF(oracle_owner, ''), 'IFSAPP'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE db_type = 'Oracle'
+          AND system_name = 'IFS'
+        """
     )
     con.commit()
 
@@ -1530,7 +1582,8 @@ def create_generic_adapter(profile: dict[str, Any]) -> DatabaseAdapter | None:
         owner = str(profile.get("oracle_owner") or profile.get("default_schema") or "IFSAPP")
         db = OracleBaseCls(prefix=prefix, owner_default=owner)
         db.connect()
-        return OracleDatabaseAdapter(db, owner=owner)
+        suspect_tables = load_suspect_oracle_tables(owner)
+        return OracleDatabaseAdapter(db, owner=owner, table_names=suspect_tables)
     return None
 
 
@@ -1740,26 +1793,173 @@ def page_connections() -> None:
                 rerun()
 
 
-def select_generic_columns(
+def unique_in_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def selectbox_valid(label: str, options: list[str], key: str, index: int = 0) -> str:
+    if key in st.session_state and st.session_state[key] not in options:
+        del st.session_state[key]
+    if not options:
+        options = [""]
+    return st.selectbox(label, options, index=min(index, len(options) - 1), key=key)
+
+
+def adapter_default_schema(adapter: DatabaseAdapter) -> str | None:
+    if isinstance(adapter, SQLServerDatabaseAdapter):
+        return adapter.default_schema
+    if isinstance(adapter, OracleDatabaseAdapter):
+        return adapter.owner
+    return None
+
+
+def select_generic_search_surface(
     label: str,
-    columns: list[ColumnRef],
+    adapter: DatabaseAdapter,
     key_prefix: str,
-    allow_all_columns: bool = True,
-) -> list[ColumnRef]:
-    if not columns:
-        st.info(f"Ingen kolonner funnet for {label.lower()}.")
-        return []
+    allow_all_columns: bool = False,
+) -> tuple[list[ColumnRef], list[ColumnRef]]:
+    object_type_map = {
+        "Tabeller": ["TABLE"],
+        "Views": ["VIEW"],
+    }
 
+    if isinstance(adapter, (SQLServerDatabaseAdapter, OracleDatabaseAdapter)):
+        selected_object_label = selectbox_valid(
+            f"{label} 1) Views/tabeller",
+            list(object_type_map.keys()),
+            key=f"{key_prefix}_object_type",
+        )
+
+        schema_options = adapter.list_schemas()
+        current_schema = adapter_default_schema(adapter)
+        schema_values = list(schema_options)
+        if current_schema and current_schema not in schema_values:
+            schema_values.insert(0, current_schema)
+        if not schema_values and current_schema:
+            schema_values = [current_schema]
+
+        selected_schema = current_schema
+        if schema_values:
+            default_index = schema_values.index(current_schema) if current_schema in schema_values else 0
+            selected_schema = selectbox_valid(
+                f"{label} 2) Schema",
+                schema_values,
+                key=f"{key_prefix}_schema",
+                index=default_index,
+            )
+        elif current_schema:
+            st.caption(f"{label} schema: {current_schema}")
+
+        adapter.configure_metadata_filter(
+            schema=selected_schema,
+            object_types=object_type_map[selected_object_label],
+        )
+    else:
+        st.caption(f"{label} 1) Views/tabeller: Tabeller")
+        selected_schema = None
+
+    columns = adapter.list_columns()
     tables = sorted({column.table for column in columns})
-    selected_table = st.selectbox(f"{label} tabell", ["Alle tabeller"] + tables, key=f"{key_prefix}_table")
-    table_columns = columns if selected_table == "Alle tabeller" else [c for c in columns if c.table == selected_table]
+    st.caption(f"Etter filter: {len(tables)} objekter, {len(columns)} kolonner")
 
-    column_names = sorted({column.column for column in table_columns})
-    column_options = ["Alle kolonner"] + column_names if allow_all_columns else column_names
-    selected_column = st.selectbox(f"{label} kolonne", column_options, key=f"{key_prefix}_column")
-    if selected_column == "Alle kolonner":
-        return table_columns
-    return [c for c in table_columns if c.column == selected_column]
+    if not columns:
+        st.info(f"Ingen kolonner funnet for {label.lower()} med valgt filter.")
+        return columns, []
+
+    selected_table = selectbox_valid(
+        f"{label} 3) Tabell",
+        ["Velg tabell"] + tables,
+        key=f"{key_prefix}_table",
+    )
+    if selected_table == "Velg tabell":
+        return columns, []
+
+    table_columns = [column for column in columns if column.table == selected_table]
+    column_names = unique_in_order([column.column for column in table_columns])
+    column_options = ["Velg kolonne"] + column_names
+    if allow_all_columns:
+        column_options.insert(1, "Alle kolonner i valgt tabell")
+
+    selected_column = selectbox_valid(
+        f"{label} 4) Kolonne",
+        column_options,
+        key=f"{key_prefix}_column",
+    )
+    if selected_column == "Velg kolonne":
+        return columns, []
+    if selected_column == "Alle kolonner i valgt tabell":
+        return columns, table_columns
+    return columns, [column for column in table_columns if column.column == selected_column]
+
+
+def select_generic_search_scope(
+    label: str,
+    adapter: DatabaseAdapter,
+    key_prefix: str,
+) -> list[ColumnRef]:
+    if isinstance(adapter, (SQLServerDatabaseAdapter, OracleDatabaseAdapter)):
+        schema_options = adapter.list_schemas()
+        current_schema = adapter_default_schema(adapter)
+        schema_values = list(schema_options)
+        if current_schema and current_schema not in schema_values:
+            schema_values.insert(0, current_schema)
+        if not schema_values and current_schema:
+            schema_values = [current_schema]
+
+        selected_schema = current_schema
+        if schema_values:
+            default_index = schema_values.index(current_schema) if current_schema in schema_values else 0
+            selected_schema = selectbox_valid(
+                f"{label} schema",
+                schema_values,
+                key=f"{key_prefix}_scope_schema",
+                index=default_index,
+            )
+        elif current_schema:
+            st.caption(f"{label} schema: {current_schema}")
+
+        adapter.configure_metadata_filter(
+            schema=selected_schema,
+            object_types=["TABLE", "VIEW"],
+        )
+        st.caption("Soker i alle tabeller/views i valgt schema.")
+    else:
+        st.caption("Soker i alle tabeller i valgt database.")
+
+    columns = adapter.list_columns()
+    tables = sorted({column.table for column in columns})
+    st.caption(f"Sokeomrade: {len(tables)} objekter, {len(columns)} kolonner")
+    if not columns:
+        if isinstance(adapter, OracleDatabaseAdapter) and adapter.table_names:
+            st.warning(
+                "Destinasjonen har 0 kolonner etter Oracle suspects-filteret. "
+                "Sjekk at tabellene i ifs_knowledge/suspects.txt finnes i valgt schema."
+            )
+            with st.expander("Vis suspects-filter"):
+                st.write(list(adapter.table_names))
+        else:
+            st.info(f"Ingen kolonner funnet for {label.lower()} med valgt scope.")
+    return columns
+
+
+def reset_session_keys(*keys: str) -> None:
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+def reset_when_signature_changes(signature_key: str, signature: tuple[Any, ...], keys_to_reset: tuple[str, ...]) -> None:
+    old_signature = st.session_state.get(signature_key)
+    if old_signature is not None and old_signature != signature:
+        reset_session_keys(*keys_to_reset)
+    st.session_state[signature_key] = signature
 
 
 def page_generic_db_search() -> None:
@@ -1807,7 +2007,14 @@ def page_generic_db_search() -> None:
 
     try:
         source_adapter = create_generic_adapter(source_profile)
-        destination_adapter = create_generic_adapter(destination_profile)
+        if (
+            source_profile
+            and destination_profile
+            and source_profile.get("connection_profile_id") == destination_profile.get("connection_profile_id")
+        ):
+            destination_adapter = source_adapter
+        else:
+            destination_adapter = create_generic_adapter(destination_profile)
     except Exception as exc:
         st.error(f"Klarte ikke apne connection: {exc}")
         return
@@ -1820,26 +2027,62 @@ def page_generic_db_search() -> None:
         return
 
     try:
-        source_engine = GenericDatabaseSearch(source_adapter)
-        destination_engine = GenericDatabaseSearch(destination_adapter)
-        source_columns = source_adapter.list_columns()
-        destination_columns = destination_adapter.list_columns()
-
-        metric_cols = st.columns(2)
-        metric_cols[0].metric("Kildekolonner", len(source_columns))
-        metric_cols[1].metric("Destinasjonskolonner", len(destination_columns))
-
         source_select, destination_select = st.columns(2)
         with source_select:
-            selected_source_columns = select_generic_columns("Kilde", source_columns, "generic_source")
+            selected_source_columns: list[ColumnRef]
+            source_columns, selected_source_columns = select_generic_search_surface(
+                "Kilde",
+                source_adapter,
+                "generic_source",
+            )
         with destination_select:
-            selected_destination_columns = select_generic_columns(
+            destination_columns = select_generic_search_scope(
                 "Destinasjon",
-                destination_columns,
+                destination_adapter,
                 "generic_destination",
             )
 
-        if st.button("1) Finn unike verdier"):
+        source_signature = (
+            source_profile.get("connection_profile_id"),
+            tuple(column.label for column in selected_source_columns),
+            int(min_length),
+            int(max_values_per_column),
+            int(max_columns),
+        )
+        destination_signature = (
+            destination_profile.get("connection_profile_id"),
+            bool(same_as_source),
+            st.session_state.get("generic_destination_scope_schema"),
+        )
+        reset_when_signature_changes(
+            "generic_source_signature",
+            source_signature,
+            ("generic_unique_values", "generic_value_hits"),
+        )
+        reset_when_signature_changes(
+            "generic_destination_signature",
+            destination_signature,
+            ("generic_value_hits",),
+        )
+
+        source_engine = GenericDatabaseSearch(source_adapter)
+        destination_engine = GenericDatabaseSearch(destination_adapter)
+
+        metric_cols = st.columns(2)
+        metric_cols[0].metric("Kildekolonner etter filter", len(source_columns))
+        metric_cols[1].metric("Destinasjonskolonner etter filter", len(destination_columns))
+        if isinstance(source_adapter, OracleDatabaseAdapter) and source_adapter.table_names:
+            metric_cols[0].caption(f"Oracle suspects-filter: {len(source_adapter.table_names)} tabeller")
+        if isinstance(destination_adapter, OracleDatabaseAdapter) and destination_adapter.table_names:
+            metric_cols[1].caption(f"Oracle suspects-filter: {len(destination_adapter.table_names)} tabeller")
+
+        if not selected_source_columns:
+            st.info("Velg kilde: type, schema, tabell og kolonne forst.")
+        if not destination_columns:
+            reset_session_keys("generic_value_hits")
+            st.info("Velg destinasjon: connection/database og eventuelt schema.")
+
+        if st.button("1) Finn unike verdier", disabled=not selected_source_columns):
             unique_df = source_engine.find_unique_values(
                 min_length=int(min_length),
                 max_values_per_column=int(max_values_per_column),
@@ -1891,12 +2134,12 @@ def page_generic_db_search() -> None:
                     index=["text", "number", "date"].index(str(selected_value_row.get("value_kind") or "text")),
                 )
 
-                if st.button("2) Let etter valgt verdi"):
+                if st.button("2) Let etter valgt verdi", disabled=not destination_columns):
                     hits_df = destination_engine.search_single_value(
                         manual_value,
                         value_kind=manual_kind,
                         max_hits_per_column=100,
-                        columns=selected_destination_columns,
+                        columns=destination_columns,
                     )
                     st.session_state["generic_value_hits"] = hits_df
 

@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 ifs_knowledge/*
 !ifs_knowledge/README.md
+!ifs_knowledge/suspects.txt
